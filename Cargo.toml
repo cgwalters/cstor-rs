@@ -1,0 +1,45 @@
+[package]
+name = "cstor-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cap-std = "3.0"
+cap-std-ext = "4.0.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+flate2 = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tar = "0.4"
+base64 = "0.21"
+crc = "3.0"
+sha2 = "0.10"
+oci-spec = "0.8.3"
+ocidir = "0.6.0"
+camino = "1.2.1"
+rustix = { version = "0.38", features = ["fs", "process"] }
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[[bin]]
+name = "cstor-rs"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "tar-diff"
+path = "src/bin/tar-diff.rs"
+
+[lints.rust]
+# Require an extra opt-in for unsafe
+unsafe_code = "deny"
+# Absolutely must handle errors
+unused_must_use = "forbid"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+# Feel free to comment this one out locally during development of a patch.
+dead_code = "deny"
