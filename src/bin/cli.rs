@@ -37,7 +37,7 @@ use std::io::{self, Write};
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Environment variable set when we've re-execed into a user namespace
@@ -556,7 +556,7 @@ fn reflink_to_dir(
     for entry in &toc.entries {
         let layer_id = layer_map
             .get(&entry.name)
-            .with_context(|| format!("No layer mapping for entry: {}", entry.name))?;
+            .with_context(|| format!("No layer mapping for entry: {}", entry.name.display()))?;
 
         // Get or open the layer (using entry API for efficiency)
         if !layer_cache.contains_key(layer_id) {
@@ -599,10 +599,10 @@ fn extract_toc_entry(
     use cstor_rs::TocEntryType;
     use rustix::fs::ioctl_ficlone;
 
-    let path = Path::new(&entry.name);
+    let path = &entry.name;
 
     // Skip empty paths
-    if entry.name.is_empty() {
+    if path.as_os_str().is_empty() {
         return Ok(());
     }
 

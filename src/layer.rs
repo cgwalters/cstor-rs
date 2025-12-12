@@ -224,7 +224,7 @@ impl Layer {
     /// Open a file in the layer's diff directory using fd-relative operations.
     ///
     /// All access is relative to the diff_dir Dir handle.
-    pub fn open_file(&self, path: &str) -> Result<cap_std::fs::File> {
+    pub fn open_file(&self, path: impl AsRef<std::path::Path>) -> Result<cap_std::fs::File> {
         self.diff_dir.open(path).map_err(StorageError::Io)
     }
 
@@ -232,20 +232,20 @@ impl Layer {
     ///
     /// This is useful for operations that need to pass the file to system calls
     /// like `ioctl_ficlone` for reflink copies, or for reading file contents.
-    pub fn open_file_std(&self, path: &str) -> Result<std::fs::File> {
+    pub fn open_file_std(&self, path: impl AsRef<std::path::Path>) -> Result<std::fs::File> {
         let file = self.diff_dir.open(path).map_err(StorageError::Io)?;
         Ok(file.into_std())
     }
 
     /// Get metadata for a file in the layer's diff directory.
-    pub fn metadata(&self, path: &str) -> Result<cap_std::fs::Metadata> {
+    pub fn metadata(&self, path: impl AsRef<std::path::Path>) -> Result<cap_std::fs::Metadata> {
         self.diff_dir
             .metadata(path)
             .map_err(|e| StorageError::Io(e))
     }
 
     /// Read directory entries using Dir handle.
-    pub fn read_dir(&self, path: &str) -> Result<cap_std::fs::ReadDir> {
+    pub fn read_dir(&self, path: impl AsRef<std::path::Path>) -> Result<cap_std::fs::ReadDir> {
         self.diff_dir
             .read_dir(path)
             .map_err(|e| StorageError::Io(e))

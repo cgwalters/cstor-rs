@@ -20,13 +20,14 @@
 //! let toc = Toc::from_layer(&storage, &layer)?;
 //!
 //! for entry in &toc.entries {
-//!     println!("{}: {:?}", entry.name, entry.entry_type);
+//!     println!("{}: {:?}", entry.name.display(), entry.entry_type);
 //! }
 //! # Ok::<(), cstor_rs::StorageError>(())
 //! ```
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -120,7 +121,7 @@ const OPAQUE_WHITEOUT_SUFFIX: &str = OPAQUE_WHITEOUT.split_at(WHITEOUT_PREFIX.le
 pub struct TocEntry {
     /// Complete path in the layer (e.g., "usr/bin/bash").
     /// Does not include leading "./" or "/".
-    pub name: String,
+    pub name: PathBuf,
 
     /// Type of this entry.
     #[serde(rename = "type")]
@@ -178,11 +179,7 @@ impl TocEntry {
     /// An opaque whiteout (`.wh..wh..opq`) indicates that the directory
     /// should hide all content from lower layers.
     pub fn is_opaque_whiteout(&self) -> bool {
-        let filename = match self.name.rsplit_once('/') {
-            Some((_, name)) => name,
-            None => &self.name,
-        };
-        filename == OPAQUE_WHITEOUT
+        self.name.file_name() == Some(OsStr::new(OPAQUE_WHITEOUT))
     }
 
     /// Check if this entry is a whiteout file (but not an opaque marker).
@@ -197,11 +194,8 @@ impl TocEntry {
     ///
     /// For a whiteout at `foo/bar/.wh.baz`, returns `Some("foo/bar/baz")`.
     /// Returns `None` if this is not a whiteout entry.
-    pub fn whiteout_target(&self) -> Option<String> {
-        let (parent, filename) = match self.name.rsplit_once('/') {
-            Some((p, f)) => (Some(p), f),
-            None => (None, self.name.as_str()),
-        };
+    pub fn whiteout_target(&self) -> Option<PathBuf> {
+        let filename = self.name.file_name()?.to_str()?;
 
         // Must start with whiteout prefix and not be the opaque marker
         let target_filename = filename.strip_prefix(WHITEOUT_PREFIX)?;
@@ -210,26 +204,23 @@ impl TocEntry {
             return None;
         }
 
-        match parent {
-            Some(p) => Some(format!("{}/{}", p, target_filename)),
-            None => Some(target_filename.to_string()),
+        match self.name.parent() {
+            Some(p) if !p.as_os_str().is_empty() => Some(p.join(target_filename)),
+            _ => Some(PathBuf::from(target_filename)),
         }
     }
 
     /// Get the directory path for an opaque whiteout marker.
     ///
-    /// For an opaque marker at `foo/bar/.wh..wh..opq`, returns `Some("foo/bar")`.
+    /// For an opaque marker at `foo/bar/.wh..wh..opq`, returns `Some(Path::new("foo/bar"))`.
     /// Returns `None` if this is not an opaque whiteout.
-    pub fn opaque_dir(&self) -> Option<&str> {
+    pub fn opaque_dir(&self) -> Option<&Path> {
         if !self.is_opaque_whiteout() {
             return None;
         }
 
-        // Return the parent directory, or empty string for root
-        self.name
-            .rsplit_once('/')
-            .map(|(parent, _)| parent)
-            .or(Some(""))
+        // Return the parent directory, or empty path for root
+        Some(self.name.parent().unwrap_or(Path::new("")))
     }
 
     /// Create a TocEntry from a TarHeader.
@@ -237,10 +228,10 @@ impl TocEntry {
         let entry_type = TocEntryType::from_typeflag(header.typeflag)?;
 
         // Normalize the name (strip leading "./")
-        let name = header.normalized_name().to_string();
+        let name = PathBuf::from(header.normalized_name());
 
         // Skip empty names (root directory marker)
-        if name.is_empty() {
+        if name.as_os_str().is_empty() {
             return None;
         }
 
@@ -379,11 +370,12 @@ impl Toc {
     /// # Example
     ///
     /// ```
+    /// use std::path::PathBuf;
     /// use cstor_rs::toc::{Toc, TocEntry, TocEntryType};
     ///
     /// let mut base = Toc::new();
     /// base.entries.push(TocEntry {
-    ///     name: "etc/passwd".to_string(),
+    ///     name: PathBuf::from("etc/passwd"),
     ///     entry_type: TocEntryType::Reg,
     ///     mode: 0o644,
     ///     uid: 0,
@@ -401,7 +393,7 @@ impl Toc {
     ///
     /// let mut upper = Toc::new();
     /// upper.entries.push(TocEntry {
-    ///     name: "etc/.wh.passwd".to_string(),
+    ///     name: PathBuf::from("etc/.wh.passwd"),
     ///     entry_type: TocEntryType::Reg,
     ///     mode: 0o644,
     ///     uid: 0,
@@ -430,9 +422,9 @@ impl Toc {
 
         // Insert existing entries into tree (skip entries with invalid paths)
         for entry in self.entries.drain(..) {
-            if let Err(e) = tree.insert(OsStr::new(&entry.name), Inode::new_leaf(entry.clone())) {
+            if let Err(e) = tree.insert(entry.name.as_os_str(), Inode::new_leaf(entry.clone())) {
                 eprintln!(
-                    "Warning: skipping entry with invalid path '{}': {}",
+                    "Warning: skipping entry with invalid path '{:?}': {}",
                     entry.name, e
                 );
             }
@@ -443,7 +435,7 @@ impl Toc {
             if let Some(opaque_dir) = entry.opaque_dir() {
                 // Opaque whiteout: clear all entries UNDER this directory from lower layers.
                 // The directory itself is NOT removed - only its contents from lower layers.
-                if opaque_dir.is_empty() {
+                if opaque_dir.as_os_str().is_empty() {
                     // Root opaque marker clears everything
                     tree = FileSystem::new();
                 } else {
@@ -451,10 +443,11 @@ impl Toc {
                     // First, remove all entries that start with this prefix.
                     // We need to collect and remove since clear_directory only
                     // clears directory inode contents, but we store entries as leaves.
-                    let prefix = format!("{}/", opaque_dir);
                     let paths_to_remove: Vec<String> = tree
                         .iter_leaves()
-                        .filter(|(path, _)| path.starts_with(&prefix))
+                        .filter(|(path, _)| {
+                            Path::new(path).starts_with(opaque_dir) && Path::new(path) != opaque_dir
+                        })
                         .map(|(path, _)| path.clone())
                         .collect();
                     for path in paths_to_remove {
@@ -465,12 +458,11 @@ impl Toc {
             } else if let Some(target) = entry.whiteout_target() {
                 // Regular whiteout: remove the target entry and anything under it.
                 // First remove the target itself.
-                let _ = tree.remove(OsStr::new(&target));
+                let _ = tree.remove(target.as_os_str());
                 // Then remove all entries under the target (if it was a directory).
-                let prefix = format!("{}/", target);
                 let paths_to_remove: Vec<String> = tree
                     .iter_leaves()
-                    .filter(|(path, _)| path.starts_with(&prefix))
+                    .filter(|(path, _)| Path::new(path).starts_with(&target))
                     .map(|(path, _)| path.clone())
                     .collect();
                 for path in paths_to_remove {
@@ -480,7 +472,7 @@ impl Toc {
             } else {
                 // Regular entry: add or replace.
                 // Reject paths with . or .. components for security.
-                if let Err(e) = tree.insert(OsStr::new(&entry.name), Inode::new_leaf(entry.clone()))
+                if let Err(e) = tree.insert(entry.name.as_os_str(), Inode::new_leaf(entry.clone()))
                 {
                     match e {
                         TreeError::InvalidFilename(path) => {
@@ -490,7 +482,7 @@ impl Toc {
                             );
                         }
                         _ => {
-                            eprintln!("Warning: failed to insert entry '{}': {}", entry.name, e);
+                            eprintln!("Warning: failed to insert entry '{:?}': {}", entry.name, e);
                         }
                     }
                 }
@@ -503,7 +495,7 @@ impl Toc {
             .map(|(path, entry)| {
                 // Update the name to the canonical path from the tree
                 let mut e = entry;
-                e.name = path;
+                e.name = PathBuf::from(path);
                 e
             })
             .collect();
@@ -685,7 +677,7 @@ impl Toc {
     ///
     /// for entry in &toc.entries {
     ///     if let Some(layer_id) = layer_map.get(&entry.name) {
-    ///         println!("{} is from layer {}", entry.name, layer_id);
+    ///         println!("{:?} is from layer {}", entry.name, layer_id);
     ///     }
     /// }
     /// # Ok::<(), cstor_rs::StorageError>(())
@@ -693,7 +685,7 @@ impl Toc {
     pub fn from_image_with_layers(
         storage: &Storage,
         image: &crate::image::Image,
-    ) -> Result<(Self, HashMap<String, String>)> {
+    ) -> Result<(Self, HashMap<PathBuf, String>)> {
         let layer_ids = image.layers()?;
 
         // Use a tree that stores (TocEntry, layer_id) pairs.
@@ -709,14 +701,16 @@ impl Toc {
             for entry in layer_toc.entries {
                 if let Some(opaque_dir) = entry.opaque_dir() {
                     // Opaque whiteout: clear all entries UNDER this directory.
-                    if opaque_dir.is_empty() {
+                    if opaque_dir.as_os_str().is_empty() {
                         tree = FileSystem::new();
                     } else {
                         // Remove all entries that start with this prefix
-                        let prefix = format!("{}/", opaque_dir);
                         let paths_to_remove: Vec<String> = tree
                             .iter_leaves()
-                            .filter(|(path, _)| path.starts_with(&prefix))
+                            .filter(|(path, _)| {
+                                Path::new(path).starts_with(opaque_dir)
+                                    && Path::new(path) != opaque_dir
+                            })
                             .map(|(path, _)| path.clone())
                             .collect();
                         for path in paths_to_remove {
@@ -726,11 +720,10 @@ impl Toc {
                     // Don't add opaque marker
                 } else if let Some(target) = entry.whiteout_target() {
                     // Regular whiteout: remove the target and anything under it.
-                    let _ = tree.remove(OsStr::new(&target));
-                    let prefix = format!("{}/", target);
+                    let _ = tree.remove(target.as_os_str());
                     let paths_to_remove: Vec<String> = tree
                         .iter_leaves()
-                        .filter(|(path, _)| path.starts_with(&prefix))
+                        .filter(|(path, _)| Path::new(path).starts_with(&target))
                         .map(|(path, _)| path.clone())
                         .collect();
                     for path in paths_to_remove {
@@ -741,9 +734,9 @@ impl Toc {
                     // Regular entry: add or replace with layer ID.
                     // Reject paths with . or .. components for security.
                     let data = (entry.clone(), layer_id.clone());
-                    if let Err(e) = tree.insert(OsStr::new(&entry.name), Inode::new_leaf(data)) {
+                    if let Err(e) = tree.insert(entry.name.as_os_str(), Inode::new_leaf(data)) {
                         eprintln!(
-                            "Warning: skipping entry with invalid path '{}': {}",
+                            "Warning: skipping entry with invalid path '{:?}': {}",
                             entry.name, e
                         );
                     }
@@ -757,6 +750,7 @@ impl Toc {
 
         for (path, (entry, layer_id)) in tree.into_leaves() {
             let mut e = entry;
+            let path = PathBuf::from(path);
             e.name = path.clone();
             entries.push(e);
             layer_map.insert(path, layer_id);
@@ -820,7 +814,7 @@ mod tests {
     /// Helper to create a minimal TocEntry for testing
     fn make_entry(name: &str) -> TocEntry {
         TocEntry {
-            name: name.to_string(),
+            name: PathBuf::from(name),
             entry_type: TocEntryType::Reg,
             mode: 0o644,
             uid: 0,
@@ -839,7 +833,7 @@ mod tests {
 
     fn make_dir_entry(name: &str) -> TocEntry {
         TocEntry {
-            name: name.to_string(),
+            name: PathBuf::from(name),
             entry_type: TocEntryType::Dir,
             mode: 0o755,
             uid: 0,
@@ -886,15 +880,15 @@ mod tests {
     fn test_whiteout_target() {
         assert_eq!(
             make_entry(".wh.foo").whiteout_target(),
-            Some("foo".to_string())
+            Some(PathBuf::from("foo"))
         );
         assert_eq!(
             make_entry("etc/.wh.passwd").whiteout_target(),
-            Some("etc/passwd".to_string())
+            Some(PathBuf::from("etc/passwd"))
         );
         assert_eq!(
             make_entry("usr/bin/.wh.bash").whiteout_target(),
-            Some("usr/bin/bash".to_string())
+            Some(PathBuf::from("usr/bin/bash"))
         );
 
         // Not whiteouts return None
@@ -904,11 +898,14 @@ mod tests {
 
     #[test]
     fn test_opaque_dir() {
-        assert_eq!(make_entry(".wh..wh..opq").opaque_dir(), Some(""));
-        assert_eq!(make_entry("etc/.wh..wh..opq").opaque_dir(), Some("etc"));
+        assert_eq!(make_entry(".wh..wh..opq").opaque_dir(), Some(Path::new("")));
+        assert_eq!(
+            make_entry("etc/.wh..wh..opq").opaque_dir(),
+            Some(Path::new("etc"))
+        );
         assert_eq!(
             make_entry("usr/share/doc/.wh..wh..opq").opaque_dir(),
-            Some("usr/share/doc")
+            Some(Path::new("usr/share/doc"))
         );
 
         // Not opaque whiteouts return None
@@ -932,7 +929,7 @@ mod tests {
         base.merge(upper);
 
         assert_eq!(base.entries.len(), 1);
-        assert_eq!(base.entries[0].name, "etc/passwd");
+        assert_eq!(base.entries[0].name, Path::new("etc/passwd"));
         assert_eq!(base.entries[0].size, Some(200)); // Upper layer's version
     }
 
@@ -951,7 +948,7 @@ mod tests {
         base.merge(upper);
 
         assert_eq!(base.entries.len(), 1);
-        assert_eq!(base.entries[0].name, "etc/shadow");
+        assert_eq!(base.entries[0].name, Path::new("etc/shadow"));
     }
 
     #[test]
@@ -970,7 +967,7 @@ mod tests {
         base.merge(upper);
 
         assert_eq!(base.entries.len(), 1);
-        assert_eq!(base.entries[0].name, "usr/bin/bash");
+        assert_eq!(base.entries[0].name, Path::new("usr/bin/bash"));
     }
 
     #[test]
@@ -991,8 +988,8 @@ mod tests {
         base.merge(upper);
 
         assert_eq!(base.entries.len(), 2);
-        assert_eq!(base.entries[0].name, "etc");
-        assert_eq!(base.entries[1].name, "usr/bin/bash");
+        assert_eq!(base.entries[0].name, Path::new("etc"));
+        assert_eq!(base.entries[1].name, Path::new("usr/bin/bash"));
     }
 
     #[test]
@@ -1011,7 +1008,7 @@ mod tests {
         base.merge(upper);
 
         assert_eq!(base.entries.len(), 1);
-        assert_eq!(base.entries[0].name, "etc/hosts");
+        assert_eq!(base.entries[0].name, Path::new("etc/hosts"));
     }
 
     #[test]
@@ -1036,7 +1033,7 @@ mod tests {
 
         base.merge(layer3);
         assert_eq!(base.entries.len(), 1);
-        assert_eq!(base.entries[0].name, "etc/passwd");
+        assert_eq!(base.entries[0].name, Path::new("etc/passwd"));
         assert_eq!(base.entries[0].size, Some(300));
     }
 
@@ -1070,9 +1067,9 @@ mod tests {
         base.merge(upper);
 
         assert_eq!(base.entries.len(), 3);
-        assert_eq!(base.entries[0].name, "a_file");
-        assert_eq!(base.entries[1].name, "m_file");
-        assert_eq!(base.entries[2].name, "z_file");
+        assert_eq!(base.entries[0].name, Path::new("a_file"));
+        assert_eq!(base.entries[1].name, Path::new("m_file"));
+        assert_eq!(base.entries[2].name, Path::new("z_file"));
     }
 
     #[test]
@@ -1085,7 +1082,7 @@ mod tests {
         base.merge(upper);
 
         assert_eq!(base.entries.len(), 1);
-        assert_eq!(base.entries[0].name, "foo");
+        assert_eq!(base.entries[0].name, Path::new("foo"));
     }
 
     #[test]
@@ -1098,7 +1095,7 @@ mod tests {
         base.merge(upper);
 
         assert_eq!(base.entries.len(), 1);
-        assert_eq!(base.entries[0].name, "foo");
+        assert_eq!(base.entries[0].name, Path::new("foo"));
     }
 
     #[test]
@@ -1115,7 +1112,7 @@ mod tests {
 
         // The dotdot path should be rejected, only original entry remains
         assert_eq!(base.entries.len(), 1);
-        assert_eq!(base.entries[0].name, "etc/passwd");
+        assert_eq!(base.entries[0].name, Path::new("etc/passwd"));
     }
 
     #[test]
@@ -1148,7 +1145,7 @@ mod tests {
 
         // Only the original foo/bar should exist
         assert_eq!(base.entries.len(), 1);
-        assert_eq!(base.entries[0].name, "foo/bar");
+        assert_eq!(base.entries[0].name, Path::new("foo/bar"));
     }
 
     #[test]
@@ -1163,6 +1160,6 @@ mod tests {
 
         // Leading / is normalized away by the tree
         assert_eq!(base.entries.len(), 1);
-        assert_eq!(base.entries[0].name, "etc/passwd");
+        assert_eq!(base.entries[0].name, Path::new("etc/passwd"));
     }
 }
