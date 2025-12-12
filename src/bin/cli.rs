@@ -520,6 +520,7 @@ fn reflink_to_dir(
     force_copy: bool,
 ) -> Result<()> {
     use cstor_rs::Toc;
+    use std::collections::HashMap;
 
     let image = Image::open(storage, image_id).context("Failed to open image")?;
 
@@ -537,26 +538,35 @@ fn reflink_to_dir(
     let dest_dir = Dir::open_ambient_dir(&dest, ambient_authority())
         .context("Failed to open destination directory")?;
 
-    // Get layer IDs
-    let layer_ids = image.layers().context("Failed to get layer IDs")?;
+    // Build merged TOC with layer mapping
+    // This properly handles whiteouts - files deleted in upper layers won't appear
+    let (toc, layer_map) =
+        Toc::from_image_with_layers(storage, &image).context("Failed to build merged TOC")?;
+
     eprintln!(
-        "Extracting {} layers to {}",
-        layer_ids.len(),
+        "Extracting {} entries to {}",
+        toc.entries.len(),
         dest.display()
     );
 
-    // Process each layer in order
-    for (i, layer_id) in layer_ids.iter().enumerate() {
-        let layer = Layer::open(storage, layer_id).context("Failed to open layer")?;
-        eprintln!("  [{}/{}] {}", i + 1, layer_ids.len(), layer.id);
+    // Cache opened layers to avoid reopening
+    let mut layer_cache: HashMap<String, Layer> = HashMap::new();
 
-        // Build TOC for this layer
-        let toc = Toc::from_layer(storage, &layer).context("Failed to build TOC")?;
+    // Extract each entry from its source layer
+    for entry in &toc.entries {
+        let layer_id = layer_map
+            .get(&entry.name)
+            .with_context(|| format!("No layer mapping for entry: {}", entry.name))?;
 
-        // Extract each entry using TOC metadata
-        for entry in &toc.entries {
-            extract_toc_entry(&dest_dir, &layer, entry, force_copy)?;
+        // Get or open the layer (using entry API for efficiency)
+        if !layer_cache.contains_key(layer_id) {
+            let layer = Layer::open(storage, layer_id)
+                .with_context(|| format!("Failed to open layer {}", layer_id))?;
+            layer_cache.insert(layer_id.clone(), layer);
         }
+        let layer = layer_cache.get(layer_id).unwrap();
+
+        extract_toc_entry(&dest_dir, layer, entry, force_copy)?;
     }
 
     eprintln!("Successfully extracted image to {}", dest.display());

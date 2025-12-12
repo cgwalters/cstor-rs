@@ -68,6 +68,7 @@
 
 pub mod config;
 pub mod error;
+pub mod generic_tree;
 pub mod image;
 pub mod layer;
 pub mod storage;
@@ -78,6 +79,7 @@ pub mod toc;
 // Re-export commonly used types
 pub use config::{AdditionalLayerStore, StorageConfig};
 pub use error::{Result, StorageError};
+pub use generic_tree::{FileSystem, Inode, TreeError};
 pub use image::Image;
 pub use layer::Layer;
 pub use storage::Storage;

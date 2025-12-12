@@ -261,6 +261,31 @@ impl Image {
     pub fn image_dir(&self) -> &Dir {
         &self.image_dir
     }
+
+    /// Build a merged Table of Contents for this image.
+    ///
+    /// This creates a TOC representing the final flattened view of the image,
+    /// with all layer TOCs merged and whiteouts processed according to overlay
+    /// filesystem semantics.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - Reference to the Storage instance for accessing layers
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::{Storage, Image};
+    ///
+    /// let storage = Storage::discover()?;
+    /// let image = Image::open(&storage, "abc123...")?;
+    /// let toc = image.toc(&storage)?;
+    /// println!("Image has {} entries", toc.entries.len());
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn toc(&self, storage: &Storage) -> Result<crate::toc::Toc> {
+        crate::toc::Toc::from_image(storage, self)
+    }
 }
 
 #[cfg(test)]
