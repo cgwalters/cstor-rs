@@ -54,6 +54,8 @@
 
 use std::path::PathBuf;
 
+use crate::generic_tree::TreeError;
+
 /// Result type alias for operations that may return a StorageError.
 pub type Result<T> = std::result::Result<T, StorageError>;
 
@@ -95,4 +97,8 @@ pub enum StorageError {
     /// JSON parsing error occurred.
     #[error("JSON parse error: {0}")]
     JsonParse(#[from] serde_json::Error),
+
+    /// Tree operation error (e.g., invalid path).
+    #[error("tree error: {0}")]
+    Tree(#[from] TreeError),
 }

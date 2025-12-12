@@ -31,6 +31,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use tracing::debug;
+
 use crate::error::{Result, StorageError};
 use crate::generic_tree::{FileSystem, Inode, TreeError};
 use crate::layer::Layer;
@@ -409,10 +411,11 @@ impl Toc {
     ///     digest: None,
     /// });
     ///
-    /// base.merge(upper);
+    /// base.merge(upper)?;
     /// assert!(base.entries.is_empty()); // etc/passwd was whited out
+    /// # Ok::<(), cstor_rs::StorageError>(())
     /// ```
-    pub fn merge(&mut self, upper: Toc) {
+    pub fn merge(&mut self, upper: Toc) -> Result<()> {
         // Build a tree from current entries for secure path operations.
         // The tree validates paths (rejecting . and .. components) and
         // provides efficient directory clearing for opaque whiteouts.
@@ -420,13 +423,14 @@ impl Toc {
         // path handling, not representing the filesystem hierarchy.
         let mut tree: FileSystem<TocEntry> = FileSystem::new();
 
-        // Insert existing entries into tree (skip entries with invalid paths)
+        // Insert existing entries into tree.
+        // InvalidFilename errors (security) are propagated, structural errors are logged.
         for entry in self.entries.drain(..) {
             if let Err(e) = tree.insert(entry.name.as_os_str(), Inode::new_leaf(entry.clone())) {
-                eprintln!(
-                    "Warning: skipping entry with invalid path '{:?}': {}",
-                    entry.name, e
-                );
+                match e {
+                    TreeError::InvalidFilename(_) => return Err(e.into()),
+                    _ => debug!("skipping entry {:?}: {e}", entry.name),
+                }
             }
         }
 
@@ -451,14 +455,18 @@ impl Toc {
                         .map(|(path, _)| path.clone())
                         .collect();
                     for path in paths_to_remove {
-                        let _ = tree.remove(OsStr::new(&path));
+                        if let Err(e) = tree.remove(OsStr::new(&path)) {
+                            debug!("whiteout remove of {path:?} failed: {e}");
+                        }
                     }
                 }
                 // Don't add the opaque marker itself to the TOC
             } else if let Some(target) = entry.whiteout_target() {
                 // Regular whiteout: remove the target entry and anything under it.
                 // First remove the target itself.
-                let _ = tree.remove(target.as_os_str());
+                if let Err(e) = tree.remove(target.as_os_str()) {
+                    debug!("whiteout remove of {target:?} failed: {e}");
+                }
                 // Then remove all entries under the target (if it was a directory).
                 let paths_to_remove: Vec<String> = tree
                     .iter_leaves()
@@ -466,24 +474,19 @@ impl Toc {
                     .map(|(path, _)| path.clone())
                     .collect();
                 for path in paths_to_remove {
-                    let _ = tree.remove(OsStr::new(&path));
+                    if let Err(e) = tree.remove(OsStr::new(&path)) {
+                        debug!("whiteout remove of {path:?} failed: {e}");
+                    }
                 }
                 // Don't add the whiteout marker itself to the TOC
             } else {
                 // Regular entry: add or replace.
-                // Reject paths with . or .. components for security.
+                // InvalidFilename errors (security) are propagated, structural errors are logged.
                 if let Err(e) = tree.insert(entry.name.as_os_str(), Inode::new_leaf(entry.clone()))
                 {
                     match e {
-                        TreeError::InvalidFilename(path) => {
-                            eprintln!(
-                                "Warning: skipping entry with invalid path components: {:?}",
-                                path
-                            );
-                        }
-                        _ => {
-                            eprintln!("Warning: failed to insert entry '{:?}': {}", entry.name, e);
-                        }
+                        TreeError::InvalidFilename(_) => return Err(e.into()),
+                        _ => debug!("skipping entry {:?}: {e}", entry.name),
                     }
                 }
             }
@@ -499,6 +502,8 @@ impl Toc {
                 e
             })
             .collect();
+
+        Ok(())
     }
 
     /// Build a TOC from a layer by reading its tar-split metadata.
@@ -654,7 +659,7 @@ impl Toc {
         for layer_id in &layer_ids {
             let layer = Layer::open(storage, layer_id)?;
             let layer_toc = Self::from_layer(storage, &layer)?;
-            merged.merge(layer_toc);
+            merged.merge(layer_toc)?;
         }
 
         Ok(merged)
@@ -714,31 +719,37 @@ impl Toc {
                             .map(|(path, _)| path.clone())
                             .collect();
                         for path in paths_to_remove {
-                            let _ = tree.remove(OsStr::new(&path));
+                            if let Err(e) = tree.remove(OsStr::new(&path)) {
+                                debug!("whiteout remove of {path:?} failed: {e}");
+                            }
                         }
                     }
                     // Don't add opaque marker
                 } else if let Some(target) = entry.whiteout_target() {
                     // Regular whiteout: remove the target and anything under it.
-                    let _ = tree.remove(target.as_os_str());
+                    if let Err(e) = tree.remove(target.as_os_str()) {
+                        debug!("whiteout remove of {target:?} failed: {e}");
+                    }
                     let paths_to_remove: Vec<String> = tree
                         .iter_leaves()
                         .filter(|(path, _)| Path::new(path).starts_with(&target))
                         .map(|(path, _)| path.clone())
                         .collect();
                     for path in paths_to_remove {
-                        let _ = tree.remove(OsStr::new(&path));
+                        if let Err(e) = tree.remove(OsStr::new(&path)) {
+                            debug!("whiteout remove of {path:?} failed: {e}");
+                        }
                     }
                     // Don't add whiteout marker
                 } else {
                     // Regular entry: add or replace with layer ID.
-                    // Reject paths with . or .. components for security.
+                    // InvalidFilename errors (security) are propagated, structural errors are logged.
                     let data = (entry.clone(), layer_id.clone());
                     if let Err(e) = tree.insert(entry.name.as_os_str(), Inode::new_leaf(data)) {
-                        eprintln!(
-                            "Warning: skipping entry with invalid path '{:?}': {}",
-                            entry.name, e
-                        );
+                        match e {
+                            TreeError::InvalidFilename(_) => return Err(e.into()),
+                            _ => debug!("skipping entry {:?}: {e}", entry.name),
+                        }
                     }
                 }
             }
@@ -926,7 +937,7 @@ mod tests {
         upper_entry.size = Some(200); // Different size to distinguish
         upper.entries.push(upper_entry);
 
-        base.merge(upper);
+        base.merge(upper).unwrap();
 
         assert_eq!(base.entries.len(), 1);
         assert_eq!(base.entries[0].name, Path::new("etc/passwd"));
@@ -945,7 +956,7 @@ mod tests {
         let mut upper = Toc::new();
         upper.entries.push(make_entry("etc/.wh.passwd"));
 
-        base.merge(upper);
+        base.merge(upper).unwrap();
 
         assert_eq!(base.entries.len(), 1);
         assert_eq!(base.entries[0].name, Path::new("etc/shadow"));
@@ -964,7 +975,7 @@ mod tests {
         let mut upper = Toc::new();
         upper.entries.push(make_entry("usr/share/.wh.doc"));
 
-        base.merge(upper);
+        base.merge(upper).unwrap();
 
         assert_eq!(base.entries.len(), 1);
         assert_eq!(base.entries[0].name, Path::new("usr/bin/bash"));
@@ -985,7 +996,7 @@ mod tests {
         let mut upper = Toc::new();
         upper.entries.push(make_entry("etc/.wh..wh..opq"));
 
-        base.merge(upper);
+        base.merge(upper).unwrap();
 
         assert_eq!(base.entries.len(), 2);
         assert_eq!(base.entries[0].name, Path::new("etc"));
@@ -1005,7 +1016,7 @@ mod tests {
         upper.entries.push(make_entry("etc/.wh..wh..opq"));
         upper.entries.push(make_entry("etc/hosts"));
 
-        base.merge(upper);
+        base.merge(upper).unwrap();
 
         assert_eq!(base.entries.len(), 1);
         assert_eq!(base.entries[0].name, Path::new("etc/hosts"));
@@ -1028,10 +1039,10 @@ mod tests {
         recreated.size = Some(300);
         layer3.entries.push(recreated);
 
-        base.merge(layer2);
+        base.merge(layer2).unwrap();
         assert!(base.entries.is_empty()); // Whiteout removed it
 
-        base.merge(layer3);
+        base.merge(layer3).unwrap();
         assert_eq!(base.entries.len(), 1);
         assert_eq!(base.entries[0].name, Path::new("etc/passwd"));
         assert_eq!(base.entries[0].size, Some(300));
@@ -1049,7 +1060,7 @@ mod tests {
         let mut upper = Toc::new();
         upper.entries.push(make_entry(".wh..wh..opq"));
 
-        base.merge(upper);
+        base.merge(upper).unwrap();
 
         assert!(base.entries.is_empty());
     }
@@ -1064,7 +1075,7 @@ mod tests {
         let mut upper = Toc::new();
         upper.entries.push(make_entry("m_file"));
 
-        base.merge(upper);
+        base.merge(upper).unwrap();
 
         assert_eq!(base.entries.len(), 3);
         assert_eq!(base.entries[0].name, Path::new("a_file"));
@@ -1079,7 +1090,7 @@ mod tests {
 
         let upper = Toc::new(); // Empty layer
 
-        base.merge(upper);
+        base.merge(upper).unwrap();
 
         assert_eq!(base.entries.len(), 1);
         assert_eq!(base.entries[0].name, Path::new("foo"));
@@ -1092,7 +1103,7 @@ mod tests {
         let mut upper = Toc::new();
         upper.entries.push(make_entry("foo"));
 
-        base.merge(upper);
+        base.merge(upper).unwrap();
 
         assert_eq!(base.entries.len(), 1);
         assert_eq!(base.entries[0].name, Path::new("foo"));
@@ -1108,11 +1119,8 @@ mod tests {
         // Malicious path trying to escape via ..
         upper.entries.push(make_entry("etc/../etc/shadow"));
 
-        base.merge(upper);
-
-        // The dotdot path should be rejected, only original entry remains
-        assert_eq!(base.entries.len(), 1);
-        assert_eq!(base.entries[0].name, Path::new("etc/passwd"));
+        // Merge should fail due to invalid path
+        assert!(base.merge(upper).is_err());
     }
 
     #[test]
@@ -1124,10 +1132,8 @@ mod tests {
         // Paths with . component
         upper.entries.push(make_entry("./etc/passwd"));
 
-        base.merge(upper);
-
-        // The path with . should be rejected
-        assert!(base.entries.is_empty());
+        // Merge should fail due to invalid path
+        assert!(base.merge(upper).is_err());
     }
 
     #[test]
@@ -1141,11 +1147,8 @@ mod tests {
         // This path should be rejected, not treated as foo/bar
         upper.entries.push(make_entry("foo/subdir/../bar"));
 
-        base.merge(upper);
-
-        // Only the original foo/bar should exist
-        assert_eq!(base.entries.len(), 1);
-        assert_eq!(base.entries[0].name, Path::new("foo/bar"));
+        // Merge should fail due to invalid path
+        assert!(base.merge(upper).is_err());
     }
 
     #[test]
@@ -1156,7 +1159,7 @@ mod tests {
         let mut upper = Toc::new();
         upper.entries.push(make_entry("/etc/passwd"));
 
-        base.merge(upper);
+        base.merge(upper).unwrap();
 
         // Leading / is normalized away by the tree
         assert_eq!(base.entries.len(), 1);

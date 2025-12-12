@@ -237,19 +237,18 @@ fn list_images(storage: &Storage, verbose: bool) -> Result<()> {
         println!("\n{}", image.id());
 
         if verbose {
-            if let Ok(manifest) = image.manifest() {
-                println!("  Schema: {}", manifest.schema_version());
-                if let Some(media_type) = manifest.media_type() {
-                    println!("  Media type: {}", media_type);
-                }
-                let layers = manifest.layers();
-                println!("  Layers: {}", layers.len());
-                for (i, layer) in layers.iter().take(3).enumerate() {
-                    println!("    {}: {} ({} bytes)", i + 1, layer.digest(), layer.size());
-                }
-                if layers.len() > 3 {
-                    println!("    ... and {} more layers", layers.len() - 3);
-                }
+            let manifest = image.manifest().context("Failed to read manifest")?;
+            println!("  Schema: {}", manifest.schema_version());
+            if let Some(media_type) = manifest.media_type() {
+                println!("  Media type: {}", media_type);
+            }
+            let layers = manifest.layers();
+            println!("  Layers: {}", layers.len());
+            for (i, layer) in layers.iter().take(3).enumerate() {
+                println!("    {}: {} ({} bytes)", i + 1, layer.digest(), layer.size());
+            }
+            if layers.len() > 3 {
+                println!("    ... and {} more layers", layers.len() - 3);
             }
         }
     }

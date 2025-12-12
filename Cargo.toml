@@ -22,6 +22,7 @@ oci-spec = "0.8.3"
 ocidir = "0.6.0"
 camino = "1.2.1"
 rustix = { version = "0.38", features = ["fs", "process"] }
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3.0"
