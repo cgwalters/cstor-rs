@@ -86,94 +86,9 @@ tar-diff original.tar reconstructed.tar
 
 The tool reports missing entries, extra entries, and metadata/content differences between the archives.
 
-## Usage Examples
+## Library Usage
 
-### List Images
-
-```rust,no_run
-use cstor_rs::Storage;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let storage = Storage::discover()?;
-    let images = storage.list_images()?;
-    for image in images {
-        println!("Image ID: {}", image.id());
-    }
-    Ok(())
-}
-```
-
-### Export Layer Using tar-split
-
-```rust,no_run
-use cstor_rs::{Storage, Layer, TarSplitFdStream, TarSplitItem};
-use std::io::{Write, Read};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let storage = Storage::discover()?;
-    let layer = Layer::open(&storage, "layer-id")?;
-    let mut stream = TarSplitFdStream::new(&storage, &layer)?;
-
-    let mut output = std::fs::File::create("layer.tar")?;
-    while let Some(item) = stream.next()? {
-        match item {
-            TarSplitItem::Segment(bytes) => {
-                output.write_all(&bytes)?;
-            }
-            TarSplitItem::FileContent(fd, size) => {
-                let mut file = std::fs::File::from(fd);
-                let mut remaining = size;
-                let mut buffer = [0u8; 8192];
-
-                while remaining > 0 {
-                    let to_read = (remaining as usize).min(buffer.len());
-                    let n = file.read(&mut buffer[..to_read])?;
-                    output.write_all(&buffer[..n])?;
-                    remaining -= n as u64;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-```
-
-### Read File from Layer
-
-```rust,no_run
-use cstor_rs::{Storage, Layer};
-use std::io::Read;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let storage = Storage::discover()?;
-    let layer = Layer::open(&storage, "layer-id")?;
-
-    // Open a file directly from the layer
-    let mut file = layer.open_file_std("etc/hostname")?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    println!("Hostname: {}", contents);
-    Ok(())
-}
-```
-
-### Generate TOC for a Layer
-
-```rust,no_run
-use cstor_rs::{Storage, Layer, toc::Toc};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let storage = Storage::discover()?;
-    let layer = Layer::open(&storage, "layer-id")?;
-    let toc = Toc::from_layer(&storage, &layer)?;
-
-    for entry in &toc.entries {
-        println!("{}: {:?} ({} bytes)",
-            entry.name, entry.entry_type, entry.size.unwrap_or(0));
-    }
-    Ok(())
-}
-```
+The CLI serves as a demonstration of using this library from Rust for nontrivial use cases. For API examples and documentation, see the module-level documentation via `cargo doc --open`. The CLI source code in `src/bin/cstor-rs.rs` provides practical examples of all major library features.
 
 ## Prerequisites
 
