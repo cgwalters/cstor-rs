@@ -733,79 +733,121 @@ fn output_toc(storage: &Storage, image_id: &str, pretty: bool) -> Result<()> {
 ///
 /// This function demonstrates the JSON-RPC fd-passing protocol by:
 /// 1. Creating a socketpair
-/// 2. Spawning a thread to act as the "server" streaming tar-split data
+/// 2. Spawning a tokio task to act as the "server" streaming tar-split data
 /// 3. Acting as the "client" receiving messages and reconstructing the tar
 ///
 /// This validates that the wire format works correctly over Unix sockets.
 fn export_layer_ipc(storage: &Storage, layer_id: &str, output: Option<PathBuf>) -> Result<()> {
     use cstor_rs::client::TarSplitClient;
-    use cstor_rs::server::TarSplitServer;
-    use std::thread;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
 
-    // Validate the layer exists
-    let _layer = Layer::open(storage, layer_id).context("Failed to open layer")?;
+    // Validate the layer exists and get what we need
+    let layer = Layer::open(storage, layer_id).context("Failed to open layer")?;
 
-    // Clone storage and layer info for the server thread
-    let storage_root = storage
-        .root_dir()
-        .try_clone()
-        .context("Failed to clone storage root")?;
+    // We need to run both server and client in the same tokio runtime
+    // because ndjson-rpc-fdpass uses spawn_blocking internally.
+    // Since Storage is not Send, we do the tar-split iteration synchronously
+    // and collect the items first.
 
-    let layer_id_owned = layer_id.to_string();
+    // Collect all tar-split items first (sync)
+    use cstor_rs::tar_split::{TarSplitFdStream, TarSplitItem};
+    let mut stream =
+        TarSplitFdStream::new(storage, &layer).context("Failed to create tar-split stream")?;
 
-    // Create a socketpair for IPC (using std, then convert to tokio)
-    let (server_sock_std, client_sock_std) =
-        std::os::unix::net::UnixStream::pair().context("Failed to create socketpair")?;
+    let mut items = Vec::new();
+    while let Some(item) = stream.next()? {
+        items.push(item);
+    }
 
-    // Spawn server in a separate thread with its own tokio runtime
-    // (Storage is not Send, so we need a separate runtime per thread)
-    let server_thread = thread::spawn(move || -> Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("Failed to create tokio runtime in server thread")?;
-
-        runtime.block_on(async move {
-            // Convert std socket to tokio socket
-            server_sock_std
-                .set_nonblocking(true)
-                .context("Failed to set nonblocking")?;
-            let server_sock = UnixStream::from_std(server_sock_std)
-                .context("Failed to convert to tokio socket")?;
-
-            // Reopen storage and layer in the thread
-            let storage = Storage::from_root_dir(storage_root)
-                .context("Failed to reopen storage in thread")?;
-            let layer =
-                Layer::open(&storage, &layer_id_owned).context("Failed to open layer in thread")?;
-
-            let mut server = TarSplitServer::new(server_sock);
-            server
-                .stream_layer(&storage, &layer)
-                .await
-                .context("Failed to stream layer")?;
-
-            Ok(())
-        })
-    });
-
-    // Client side: receive and write tar (in current thread with its own runtime)
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    // Now run the async IPC in a single runtime
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("Failed to create tokio runtime")?;
 
     let file_count = runtime.block_on(async move {
-        // Convert std socket to tokio socket
-        client_sock_std
-            .set_nonblocking(true)
-            .context("Failed to set nonblocking")?;
-        let client_sock =
-            UnixStream::from_std(client_sock_std).context("Failed to convert to tokio socket")?;
+        // Create socketpair using tokio (creates non-blocking sockets)
+        let (server_sock, client_sock) =
+            UnixStream::pair().context("Failed to create socketpair")?;
 
-        let mut client = TarSplitClient::new(client_sock);
+        // Spawn server task
+        let server_task = tokio::spawn(async move {
+            use base64::prelude::*;
+            use cstor_rs::protocol::{FdPlaceholder, StreamMessage};
+            use ndjson_rpc_fdpass::transport::UnixSocketTransport;
+            use ndjson_rpc_fdpass::{JsonRpcMessage, JsonRpcNotification, MessageWithFds};
+            use std::collections::HashMap;
+
+            let transport = UnixSocketTransport::new(server_sock)
+                .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?;
+            let (mut sender, _receiver) = transport.split();
+
+            // Send start message
+            let start_msg = StreamMessage::Start { segments_fd: None };
+            let notification = JsonRpcNotification::new(
+                "stream.start".to_string(),
+                Some(serde_json::to_value(&start_msg).unwrap()),
+            );
+            let message = JsonRpcMessage::Notification(notification);
+            sender
+                .send(MessageWithFds::new(message, vec![]))
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send start: {}", e))?;
+
+            // Send all items
+            for item in items {
+                match item {
+                    TarSplitItem::Segment(bytes) => {
+                        let data = BASE64_STANDARD.encode(&bytes);
+                        let msg = StreamMessage::Seg { data };
+                        let notification = JsonRpcNotification::new(
+                            "stream.seg".to_string(),
+                            Some(serde_json::to_value(&msg).unwrap()),
+                        );
+                        let message = JsonRpcMessage::Notification(notification);
+                        sender
+                            .send(MessageWithFds::new(message, vec![]))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to send seg: {}", e))?;
+                    }
+                    TarSplitItem::FileContent { fd, size, name } => {
+                        let msg = StreamMessage::File {
+                            name,
+                            size,
+                            digests: HashMap::new(),
+                            fd: FdPlaceholder::new(0),
+                        };
+                        let notification = JsonRpcNotification::new(
+                            "stream.file".to_string(),
+                            Some(serde_json::to_value(&msg).unwrap()),
+                        );
+                        let message = JsonRpcMessage::Notification(notification);
+                        sender
+                            .send(MessageWithFds::new(message, vec![fd]))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to send file: {}", e))?;
+                    }
+                }
+            }
+
+            // Send end message
+            let end_msg = StreamMessage::End;
+            let notification = JsonRpcNotification::new(
+                "stream.end".to_string(),
+                Some(serde_json::to_value(&end_msg).unwrap()),
+            );
+            let message = JsonRpcMessage::Notification(notification);
+            sender
+                .send(MessageWithFds::new(message, vec![]))
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send end: {}", e))?;
+
+            Ok::<(), anyhow::Error>(())
+        });
+
+        // Client side
+        let mut client = TarSplitClient::new(client_sock).context("Failed to create client")?;
 
         let file_count = if let Some(path) = output {
             let mut file = tokio::fs::File::create(&path)
@@ -827,14 +869,14 @@ fn export_layer_ipc(storage: &Storage, layer_id: &str, output: Option<PathBuf>) 
             count
         };
 
+        // Wait for server task
+        server_task
+            .await
+            .map_err(|e| anyhow::anyhow!("Server task panicked: {}", e))?
+            .context("Server task error")?;
+
         Ok::<usize, anyhow::Error>(file_count)
     })?;
-
-    // Wait for server thread
-    server_thread
-        .join()
-        .map_err(|_| anyhow!("Server thread panicked"))?
-        .context("Server thread error")?;
 
     eprintln!(
         "Exported {} files from layer {} via IPC protocol",

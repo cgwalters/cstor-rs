@@ -24,7 +24,7 @@
 //! let layer = Layer::open(&storage, "layer-id")?;
 //!
 //! let (server_sock, client_sock) = UnixStream::pair()?;
-//! let mut server = TarSplitServer::new(server_sock);
+//! let mut server = TarSplitServer::new(server_sock)?;
 //!
 //! // Stream the layer (async)
 //! server.stream_layer(&storage, &layer).await?;
@@ -59,10 +59,16 @@ impl std::fmt::Debug for TarSplitServer {
 
 impl TarSplitServer {
     /// Create a new server from a Tokio Unix socket.
-    pub fn new(socket: UnixStream) -> Self {
-        let transport = UnixSocketTransport::new(socket);
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket cannot be converted to a transport.
+    pub fn new(socket: UnixStream) -> Result<Self> {
+        let transport = UnixSocketTransport::new(socket).map_err(|e| {
+            StorageError::TarSplitError(format!("Failed to create transport: {}", e))
+        })?;
         let (sender, _receiver) = transport.split();
-        Self { sender }
+        Ok(Self { sender })
     }
 
     /// Stream a layer's tar-split data with file descriptors.

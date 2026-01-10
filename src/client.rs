@@ -14,7 +14,7 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let stream = UnixStream::connect("/tmp/cstor.sock").await?;
-//! let mut client = TarSplitClient::new(stream);
+//! let mut client = TarSplitClient::new(stream)?;
 //!
 //! // Receive stream and write to tar
 //! let mut tar_output = tokio::fs::File::create("layer.tar").await?;
@@ -66,10 +66,16 @@ pub enum ReceivedItem {
 
 impl TarSplitClient {
     /// Create a new client from a tokio Unix socket.
-    pub fn new(socket: UnixStream) -> Self {
-        let transport = UnixSocketTransport::new(socket);
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket cannot be converted to a transport.
+    pub fn new(socket: UnixStream) -> Result<Self> {
+        let transport = UnixSocketTransport::new(socket).map_err(|e| {
+            StorageError::TarSplitError(format!("Failed to create transport: {}", e))
+        })?;
         let (_sender, receiver) = transport.split();
-        Self { receiver }
+        Ok(Self { receiver })
     }
 
     /// Receive the next item from the stream.
@@ -266,11 +272,11 @@ mod tests {
         let (sock_a, sock_b) = UnixStream::pair().unwrap();
 
         // Set up sender
-        let transport_a = UnixSocketTransport::new(sock_a);
+        let transport_a = UnixSocketTransport::new(sock_a).unwrap();
         let (mut sender, _) = transport_a.split();
 
         // Set up client
-        let mut client = TarSplitClient::new(sock_b);
+        let mut client = TarSplitClient::new(sock_b).unwrap();
 
         // Send a segment message as a notification
         let seg_params = serde_json::json!({
@@ -293,11 +299,11 @@ mod tests {
         let (sock_a, sock_b) = UnixStream::pair().unwrap();
 
         // Set up sender
-        let transport_a = UnixSocketTransport::new(sock_a);
+        let transport_a = UnixSocketTransport::new(sock_a).unwrap();
         let (mut sender, _) = transport_a.split();
 
         // Set up client
-        let mut client = TarSplitClient::new(sock_b);
+        let mut client = TarSplitClient::new(sock_b).unwrap();
 
         // Open a test file
         let file = std::fs::File::open("/etc/hosts").unwrap();
@@ -334,11 +340,11 @@ mod tests {
         let (sock_a, sock_b) = UnixStream::pair().unwrap();
 
         // Set up sender
-        let transport_a = UnixSocketTransport::new(sock_a);
+        let transport_a = UnixSocketTransport::new(sock_a).unwrap();
         let (mut sender, _) = transport_a.split();
 
         // Set up client
-        let mut client = TarSplitClient::new(sock_b);
+        let mut client = TarSplitClient::new(sock_b).unwrap();
 
         // Send end message
         let msg = make_notification("stream.end", None, vec![]);
