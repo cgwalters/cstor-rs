@@ -43,7 +43,7 @@
 //!             // Write raw TAR header/padding bytes directly
 //!             output.write_all(&bytes)?;
 //!         }
-//!         TarSplitItem::FileContent(fd, size) => {
+//!         TarSplitItem::FileContent { fd, size, .. } => {
 //!             // Write file content with proper padding
 //!             write_file_data(&mut output, fd, size)?;
 //!         }

@@ -61,8 +61,14 @@ pub enum TarSplitItem {
     Segment(Vec<u8>),
 
     /// File content to write.
-    /// Contains: (file_descriptor, size_for_padding_calculation)
-    FileContent(OwnedFd, u64),
+    FileContent {
+        /// File descriptor for the content.
+        fd: OwnedFd,
+        /// File size for padding calculation.
+        size: u64,
+        /// File name/path from the tar-split entry.
+        name: String,
+    },
 }
 
 /// Raw tar-split entry from NDJSON format before validation.
@@ -360,9 +366,9 @@ impl TarHeader {
 ///         TarSplitItem::Segment(bytes) => {
 ///             println!("Segment: {} bytes", bytes.len());
 ///         }
-///         TarSplitItem::FileContent(fd, size) => {
+///         TarSplitItem::FileContent { fd, size, name } => {
 ///             use std::os::unix::io::AsRawFd;
-///             println!("File: {} bytes, fd={}", size, fd.as_raw_fd());
+///             println!("File {}: {} bytes, fd={}", name, size, fd.as_raw_fd());
 ///         }
 ///     }
 /// }
@@ -711,7 +717,7 @@ impl TarSplitFdStream {
     ///         TarSplitItem::Segment(bytes) => {
     ///             // Write raw header/padding bytes
     ///         }
-    ///         TarSplitItem::FileContent(fd, size) => {
+    ///         TarSplitItem::FileContent { fd, size, name } => {
     ///             // Write file content + padding
     ///         }
     ///     }
@@ -792,7 +798,11 @@ impl TarSplitFdStream {
                                 // Convert to OwnedFd and return
                                 let std_file = file.into_std();
                                 let owned_fd: OwnedFd = std_file.into();
-                                return Ok(Some(TarSplitItem::FileContent(owned_fd, file_size)));
+                                return Ok(Some(TarSplitItem::FileContent {
+                                    fd: owned_fd,
+                                    size: file_size,
+                                    name: path.clone(),
+                                }));
                             }
                             // Empty file or directory - header already in preceding Segment, continue
                         }

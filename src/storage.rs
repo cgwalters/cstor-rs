@@ -245,6 +245,24 @@ impl Storage {
         Ok(conn)
     }
 
+    /// Create storage from an existing root directory handle.
+    ///
+    /// This is useful when the directory handle has already been opened,
+    /// such as when passing storage across threads.
+    ///
+    /// # Arguments
+    ///
+    /// * `root_dir` - An already-opened Dir handle to the storage root
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory is not a valid container storage.
+    pub fn from_root_dir(root_dir: Dir) -> Result<Self> {
+        Self::validate_storage(&root_dir)?;
+        let db = Self::open_database(&root_dir)?;
+        Ok(Self { root_dir, db })
+    }
+
     /// Get a reference to the root directory handle.
     ///
     /// This provides access to the underlying `Dir` handle for advanced use cases.

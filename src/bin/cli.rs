@@ -147,6 +147,21 @@ enum Commands {
         #[arg(long)]
         pretty: bool,
     },
+
+    /// Export layer as tar stream via IPC protocol (PoC)
+    ///
+    /// This command demonstrates the JSON-RPC fd-passing protocol
+    /// by streaming tar-split data through a socketpair internally.
+    /// The server sends NDJSON messages with fds, and the client
+    /// reconstructs the tar archive.
+    ExportLayerIpc {
+        /// Layer ID
+        layer_id: String,
+
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 /// Check if we need to enter a user namespace for file access.
@@ -194,7 +209,10 @@ fn main() -> Result<()> {
     // Check if this command needs user namespace access for file content
     let needs_file_access = matches!(
         cli.command,
-        Commands::ExportLayer { .. } | Commands::CopyToOci { .. } | Commands::ReflinkToDir { .. }
+        Commands::ExportLayer { .. }
+            | Commands::CopyToOci { .. }
+            | Commands::ReflinkToDir { .. }
+            | Commands::ExportLayerIpc { .. }
     );
 
     // Re-exec via podman unshare if needed
@@ -223,6 +241,9 @@ fn main() -> Result<()> {
             force_copy,
         } => reflink_to_dir(&storage, &image_id, output, force_copy)?,
         Commands::Toc { image_id, pretty } => output_toc(&storage, &image_id, pretty)?,
+        Commands::ExportLayerIpc { layer_id, output } => {
+            export_layer_ipc(&storage, &layer_id, output)?
+        }
     }
 
     Ok(())
@@ -345,7 +366,7 @@ fn export_layer(storage: &Storage, layer_id: &str, output: Option<PathBuf>) -> R
                     .write_all(&bytes)
                     .context("Failed to write segment")?;
             }
-            TarSplitItem::FileContent(fd, size) => {
+            TarSplitItem::FileContent { fd, size, .. } => {
                 // Write file content WITHOUT padding - padding is in the next Segment
                 let mut file = std::fs::File::from(fd);
                 let mut remaining = size;
@@ -414,7 +435,7 @@ fn copy_to_oci(storage: &Storage, image_id: &str, output: PathBuf) -> Result<()>
                     // Write raw segment bytes directly
                     gz.write_all(&bytes)?;
                 }
-                TarSplitItem::FileContent(fd, size) => {
+                TarSplitItem::FileContent { fd, size, .. } => {
                     // Write file content WITHOUT padding - padding is in the next Segment
                     let mut file = std::fs::File::from(fd);
                     let mut remaining = size;
@@ -705,5 +726,120 @@ fn output_toc(storage: &Storage, image_id: &str, pretty: bool) -> Result<()> {
     };
 
     println!("{}", json);
+    Ok(())
+}
+
+/// Export a layer via the IPC protocol (PoC demonstration).
+///
+/// This function demonstrates the JSON-RPC fd-passing protocol by:
+/// 1. Creating a socketpair
+/// 2. Spawning a thread to act as the "server" streaming tar-split data
+/// 3. Acting as the "client" receiving messages and reconstructing the tar
+///
+/// This validates that the wire format works correctly over Unix sockets.
+fn export_layer_ipc(storage: &Storage, layer_id: &str, output: Option<PathBuf>) -> Result<()> {
+    use cstor_rs::client::TarSplitClient;
+    use cstor_rs::server::TarSplitServer;
+    use std::thread;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    // Validate the layer exists
+    let _layer = Layer::open(storage, layer_id).context("Failed to open layer")?;
+
+    // Clone storage and layer info for the server thread
+    let storage_root = storage
+        .root_dir()
+        .try_clone()
+        .context("Failed to clone storage root")?;
+
+    let layer_id_owned = layer_id.to_string();
+
+    // Create a socketpair for IPC (using std, then convert to tokio)
+    let (server_sock_std, client_sock_std) =
+        std::os::unix::net::UnixStream::pair().context("Failed to create socketpair")?;
+
+    // Spawn server in a separate thread with its own tokio runtime
+    // (Storage is not Send, so we need a separate runtime per thread)
+    let server_thread = thread::spawn(move || -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("Failed to create tokio runtime in server thread")?;
+
+        runtime.block_on(async move {
+            // Convert std socket to tokio socket
+            server_sock_std
+                .set_nonblocking(true)
+                .context("Failed to set nonblocking")?;
+            let server_sock = UnixStream::from_std(server_sock_std)
+                .context("Failed to convert to tokio socket")?;
+
+            // Reopen storage and layer in the thread
+            let storage = Storage::from_root_dir(storage_root)
+                .context("Failed to reopen storage in thread")?;
+            let layer =
+                Layer::open(&storage, &layer_id_owned).context("Failed to open layer in thread")?;
+
+            let mut server = TarSplitServer::new(server_sock);
+            server
+                .stream_layer(&storage, &layer)
+                .await
+                .context("Failed to stream layer")?;
+
+            Ok(())
+        })
+    });
+
+    // Client side: receive and write tar (in current thread with its own runtime)
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to create tokio runtime")?;
+
+    let file_count = runtime.block_on(async move {
+        // Convert std socket to tokio socket
+        client_sock_std
+            .set_nonblocking(true)
+            .context("Failed to set nonblocking")?;
+        let client_sock =
+            UnixStream::from_std(client_sock_std).context("Failed to convert to tokio socket")?;
+
+        let mut client = TarSplitClient::new(client_sock);
+
+        let file_count = if let Some(path) = output {
+            let mut file = tokio::fs::File::create(&path)
+                .await
+                .context("Failed to create output file")?;
+            let count = client
+                .receive_to_tar(&mut file)
+                .await
+                .context("Failed to receive tar stream")?;
+            file.flush().await.context("Failed to flush output")?;
+            count
+        } else {
+            let mut stdout = tokio::io::stdout();
+            let count = client
+                .receive_to_tar(&mut stdout)
+                .await
+                .context("Failed to receive tar stream")?;
+            stdout.flush().await.context("Failed to flush stdout")?;
+            count
+        };
+
+        Ok::<usize, anyhow::Error>(file_count)
+    })?;
+
+    // Wait for server thread
+    server_thread
+        .join()
+        .map_err(|_| anyhow!("Server thread panicked"))?
+        .context("Server thread error")?;
+
+    eprintln!(
+        "Exported {} files from layer {} via IPC protocol",
+        file_count, layer_id
+    );
+
     Ok(())
 }

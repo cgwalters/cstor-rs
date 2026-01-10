@@ -942,6 +942,146 @@ fn test_toc_output() -> Result<()> {
     Ok(())
 }
 
+/// Test that IPC export produces identical output to direct export.
+///
+/// This test:
+/// 1. Ensures busybox image exists in containers-storage
+/// 2. Exports a layer using both export-layer and export-layer-ipc commands
+/// 3. Compares the resulting tar files byte-for-byte
+///
+/// This validates that the NDJSON-RPC-FD protocol with fd passing
+/// correctly reconstructs the tar stream.
+#[test]
+#[ignore] // Requires podman and test image
+fn test_ipc_export_matches_direct() -> Result<()> {
+    ensure_test_image().context("Failed to ensure test image")?;
+
+    let image_id = get_image_id(TEST_IMAGE).context("Failed to get image ID")?;
+    println!(
+        "Testing IPC export for image: {} ({})",
+        TEST_IMAGE, image_id
+    );
+
+    // Get first layer ID using cstor-rs
+    let output = Command::new("cargo")
+        .args(&[
+            "run",
+            "--bin",
+            "cstor-rs",
+            "--quiet",
+            "--",
+            "list-layers",
+            &image_id,
+        ])
+        .output()
+        .context("Failed to list layers")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Failed to list layers");
+    }
+
+    let output_str = String::from_utf8(output.stdout)?;
+    let layer_id = output_str
+        .lines()
+        .find(|line| line.contains("Layer 1:"))
+        .and_then(|line| line.split(':').nth(1))
+        .map(|s| s.trim())
+        .context("Failed to find layer ID in output")?;
+
+    println!("Testing layer: {}", layer_id);
+
+    // Create temp directory for outputs
+    let temp_dir = TempDir::new()?;
+    let direct_tar = temp_dir.path().join("direct.tar");
+    let ipc_tar = temp_dir.path().join("ipc.tar");
+
+    // Export layer directly
+    println!("\nExporting layer directly...");
+    let direct_status = Command::new("cargo")
+        .args(&[
+            "run",
+            "--bin",
+            "cstor-rs",
+            "--quiet",
+            "--",
+            "export-layer",
+            layer_id,
+            "-o",
+            direct_tar.to_str().unwrap(),
+        ])
+        .status()
+        .context("Failed to export layer directly")?;
+
+    if !direct_status.success() {
+        anyhow::bail!("Direct export failed");
+    }
+
+    // Export layer via IPC
+    println!("Exporting layer via IPC...");
+    let ipc_status = Command::new("cargo")
+        .args(&[
+            "run",
+            "--bin",
+            "cstor-rs",
+            "--quiet",
+            "--",
+            "export-layer-ipc",
+            layer_id,
+            "-o",
+            ipc_tar.to_str().unwrap(),
+        ])
+        .status()
+        .context("Failed to export layer via IPC")?;
+
+    if !ipc_status.success() {
+        anyhow::bail!("IPC export failed");
+    }
+
+    // Compare file sizes
+    let direct_meta = fs::metadata(&direct_tar).context("Failed to get direct tar metadata")?;
+    let ipc_meta = fs::metadata(&ipc_tar).context("Failed to get IPC tar metadata")?;
+
+    println!("\nComparing outputs...");
+    println!("  Direct export: {} bytes", direct_meta.len());
+    println!("  IPC export:    {} bytes", ipc_meta.len());
+
+    if direct_meta.len() != ipc_meta.len() {
+        anyhow::bail!(
+            "Tar file sizes differ: direct={}, ipc={}",
+            direct_meta.len(),
+            ipc_meta.len()
+        );
+    }
+
+    // Compare file hashes
+    let direct_data = fs::read(&direct_tar).context("Failed to read direct tar")?;
+    let ipc_data = fs::read(&ipc_tar).context("Failed to read IPC tar")?;
+
+    let direct_hash = format!("{:x}", Sha256::digest(&direct_data));
+    let ipc_hash = format!("{:x}", Sha256::digest(&ipc_data));
+
+    println!("  Direct hash:   {}", direct_hash);
+    println!("  IPC hash:      {}", ipc_hash);
+
+    if direct_hash != ipc_hash {
+        // Find first differing byte for debugging
+        for (i, (a, b)) in direct_data.iter().zip(ipc_data.iter()).enumerate() {
+            if a != b {
+                println!(
+                    "\nFirst difference at byte {}: direct=0x{:02x}, ipc=0x{:02x}",
+                    i, a, b
+                );
+                break;
+            }
+        }
+        anyhow::bail!("Tar file hashes differ");
+    }
+
+    println!("\n✓ IPC export matches direct export bit-for-bit");
+
+    Ok(())
+}
+
 /// Test that TOC entries match tar listing.
 ///
 /// This test:

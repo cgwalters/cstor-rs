@@ -575,7 +575,7 @@ impl Toc {
                         offset += 512;
                     }
                 }
-                TarSplitItem::FileContent(fd, size) => {
+                TarSplitItem::FileContent { fd, size, .. } => {
                     // Remember the file size for calculating padding in next segment
                     pending_file_size = size;
 

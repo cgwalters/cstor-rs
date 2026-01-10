@@ -66,11 +66,14 @@
 //! cstor-rs toc <image-id> --pretty
 //! ```
 
+pub mod client;
 pub mod config;
 pub mod error;
 pub mod generic_tree;
 pub mod image;
 pub mod layer;
+pub mod protocol;
+pub mod server;
 pub mod storage;
 pub mod tar_split;
 pub mod tar_writer;
