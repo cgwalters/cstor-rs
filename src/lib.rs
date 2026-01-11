@@ -73,6 +73,7 @@ pub mod generic_tree;
 pub mod image;
 pub mod layer;
 pub mod protocol;
+pub mod proxy_v2;
 pub mod server;
 pub mod storage;
 pub mod tar_split;
