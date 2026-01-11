@@ -7,7 +7,7 @@
 //! 4. Client task receives fds and reflinks files to destination
 //!
 //! Run with:
-//!   cargo run --example ipc_reflink <image-id> <dest-dir>
+//!   cargo run --example ipc_reflink <image-id> <dest-dir> [--force-copy]
 //!
 //! Example:
 //!   cargo run --example ipc_reflink busybox ~/tmp/extracted
@@ -30,16 +30,26 @@ use tokio::net::UnixStream;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: {} <image-id> <dest-dir>", args[0]);
-        eprintln!();
-        eprintln!("Example:");
-        eprintln!("  {} busybox ~/tmp/extracted", args[0]);
-        std::process::exit(1);
+
+    let force_copy = args.iter().any(|a| a == "--force-copy");
+    let positional: Vec<&String> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+
+    if positional.len() != 2 {
+        anyhow::bail!(
+            "Usage: {} <image-id> <dest-dir> [--force-copy]\n\n\
+             Example:\n  {} busybox ~/tmp/extracted\n\n\
+             Options:\n  --force-copy  Fall back to copying if reflinks fail",
+            args[0],
+            args[0]
+        );
     }
 
-    let image_id = &args[1];
-    let dest_dir = PathBuf::from(&args[2]);
+    let image_id = positional[0];
+    let dest_dir = PathBuf::from(positional[1]);
 
     // Ensure destination doesn't exist
     if dest_dir.exists() {
@@ -75,16 +85,19 @@ async fn main() -> Result<()> {
         );
 
         let layer = Layer::open(&storage, layer_id).context("Failed to open layer")?;
-        let (reflinked, copied) = extract_layer_via_ipc(&storage, &layer, &dest_dir).await?;
+        let (reflinked, copied) =
+            extract_layer_via_ipc(&storage, &layer, &dest_dir, force_copy).await?;
         total_reflinked += reflinked;
         total_copied += copied;
         total_files += reflinked + copied;
     }
 
-    println!("\n✓ Extraction complete!");
+    println!("\nExtraction complete!");
     println!("  Total files: {}", total_files);
     println!("  Reflinked:   {} (zero-copy)", total_reflinked);
-    println!("  Copied:      {} (fallback)", total_copied);
+    if total_copied > 0 {
+        println!("  Copied:      {} (fallback)", total_copied);
+    }
     println!("  Destination: {}", dest_dir.display());
 
     Ok(())
@@ -95,6 +108,7 @@ async fn extract_layer_via_ipc(
     storage: &Storage,
     layer: &Layer,
     dest_dir: &PathBuf,
+    force_copy: bool,
 ) -> Result<(usize, usize)> {
     // Collect tar-split items synchronously (Storage is not Send)
     let mut stream =
@@ -207,7 +221,9 @@ async fn extract_layer_via_ipc(
 
                 // Create parent directories
                 if let Some(parent) = dest_path.parent() {
-                    std::fs::create_dir_all(parent).ok();
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("Failed to create parent directory for {}", name)
+                    })?;
                 }
 
                 // Skip if it's a directory path or already exists
@@ -216,31 +232,35 @@ async fn extract_layer_via_ipc(
                 }
 
                 // Create destination file
-                let dest_file = match std::fs::File::create(&dest_path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("  Warning: failed to create {}: {}", name, e);
-                        continue;
-                    }
-                };
+                let dest_file = std::fs::File::create(&dest_path)
+                    .with_context(|| format!("Failed to create file {}", name))?;
 
                 // Convert OwnedFd to File for reflink
                 let src_file = std::fs::File::from(fd);
 
-                // Try reflink first, fall back to copy
+                // Try reflink - require it by default
                 match ioctl_ficlone(&dest_file, &src_file) {
                     Ok(_) => {
                         reflinked += 1;
                     }
-                    Err(_) => {
-                        // Reflink failed, fall back to copy
-                        let mut src = src_file;
-                        let mut dst = dest_file;
-                        if let Err(e) = std::io::copy(&mut src, &mut dst) {
-                            eprintln!("  Warning: failed to copy {}: {}", name, e);
-                            continue;
+                    Err(e) => {
+                        if force_copy {
+                            // Fall back to copy only if explicitly requested
+                            let mut src = src_file;
+                            let mut dst = dest_file;
+                            std::io::copy(&mut src, &mut dst)
+                                .with_context(|| format!("Failed to copy file {}", name))?;
+                            copied += 1;
+                        } else {
+                            // Clean up the created file before returning error
+                            let _ = std::fs::remove_file(&dest_path);
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "Reflink failed for {}. Use --force-copy to fall back to copying",
+                                    name
+                                )
+                            });
                         }
-                        copied += 1;
                     }
                 }
 
