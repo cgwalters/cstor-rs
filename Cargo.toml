@@ -24,7 +24,7 @@ camino = "1.2.1"
 rustix = { version = "0.38", features = ["fs", "process", "net"] }
 tracing = "0.1"
 tokio = { version = "1.40", features = ["full"] }
-ndjson-rpc-fdpass = { path = "../spec-json-rpc-fdpass" }
+ndjson-rpc-fdpass = { path = "../jsonrpc-fdpass", package = "jsonrpc-fdpass" }
 
 [dev-dependencies]
 tempfile = "3.0"
