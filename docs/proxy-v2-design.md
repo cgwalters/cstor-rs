@@ -87,50 +87,22 @@ ancillary data on the Unix socket.
 
 ## Implementation Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Client (Rust)                           │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │  containers-image-proxy-rs (updated)                        ││
-│  │  - Negotiates v2 protocol                                   ││
-│  │  - Calls GetLayerTarSplit                                   ││
-│  │  - Receives streaming notifications with FDs                ││
-│  └─────────────────────────────────────────────────────────────┘│
-│                              │                                   │
-│                              ▼                                   │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │  cstor-rs TarSplitClient                                    ││
-│  │  - Processes layer.* notifications                          ││
-│  │  - Uses FICLONE for zero-copy extraction                    ││
-│  │  - Falls back to copy if not on CoW filesystem              ││
-│  └─────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                    Unix Socket (SOCK_STREAM)
-                    with SCM_RIGHTS FD passing
-                              │
-┌─────────────────────────────────────────────────────────────────┐
-│                         Server (Go)                             │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │  skopeo experimental-image-proxy (updated)                  ││
-│  │  - Accepts v2 protocol negotiation                          ││
-│  │  - Implements GetLayerTarSplit method                       ││
-│  └─────────────────────────────────────────────────────────────┘│
-│                              │                                   │
-│                              ▼                                   │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │  jsonrpc-fdpass-go                                          ││
-│  │  - JSON-RPC 2.0 with FD passing                             ││
-│  │  - Streaming JSON framing                                   ││
-│  └─────────────────────────────────────────────────────────────┘│
-│                              │                                   │
-│                              ▼                                   │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │  containers/storage                                         ││
-│  │  - Provides tar-split metadata                              ││
-│  │  - Provides FileGetter for layer files                      ││
-│  └─────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph client["Client (Rust)"]
+        cip["containers-image-proxy-rs (updated)<br/>• Negotiates v2 protocol<br/>• Calls GetLayerTarSplit<br/>• Receives streaming notifications with FDs"]
+        cstor["cstor-rs TarSplitClient<br/>• Processes layer.* notifications<br/>• Uses FICLONE for zero-copy extraction<br/>• Falls back to copy if not on CoW filesystem"]
+        cip --> cstor
+    end
+
+    subgraph server["Server (Go)"]
+        skopeo["skopeo experimental-image-proxy (updated)<br/>• Accepts v2 protocol negotiation<br/>• Implements GetLayerTarSplit method"]
+        jsonrpc["jsonrpc-fdpass-go<br/>• JSON-RPC 2.0 with FD passing<br/>• Streaming JSON framing"]
+        storage["containers/storage<br/>• Provides tar-split metadata<br/>• Provides FileGetter for layer files"]
+        skopeo --> jsonrpc --> storage
+    end
+
+    client <-->|"Unix Socket (SOCK_STREAM)<br/>with SCM_RIGHTS FD passing"| server
 ```
 
 ## Backward Compatibility
