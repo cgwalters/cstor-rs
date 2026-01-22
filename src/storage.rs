@@ -443,6 +443,80 @@ impl Storage {
         }
         Ok(layers)
     }
+
+    /// Find an image by name.
+    ///
+    /// Searches the images.json index for an image with a matching name.
+    /// The name can be a full image reference like "docker.io/library/alpine:latest"
+    /// or a partial name like "alpine:latest" or "alpine".
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The image name to search for
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ImageNotFound`] if no image with the given name is found.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::Storage;
+    ///
+    /// let storage = Storage::discover()?;
+    /// let image = storage.find_image_by_name("alpine:latest")?;
+    /// println!("Found image: {}", image.id());
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn find_image_by_name(&self, name: &str) -> Result<crate::image::Image> {
+        use std::io::Read;
+
+        // Read images.json from overlay-images/
+        let images_dir = self.root_dir.open_dir("overlay-images")?;
+        let mut file = images_dir.open("images.json")?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+
+        // Parse the JSON array
+        let entries: Vec<ImageEntry> = serde_json::from_str(&contents)
+            .map_err(|e| StorageError::InvalidStorage(format!("Invalid images.json: {}", e)))?;
+
+        // Search for matching name
+        for entry in entries {
+            if let Some(names) = &entry.names {
+                for image_name in names {
+                    if image_name == name {
+                        return self.get_image(&entry.id);
+                    }
+                }
+            }
+        }
+
+        // Try partial matching (e.g., "alpine:latest" matches "docker.io/library/alpine:latest")
+        for entry in serde_json::from_str::<Vec<ImageEntry>>(&contents).unwrap_or_default() {
+            if let Some(names) = &entry.names {
+                for image_name in names {
+                    // Check if name is a suffix (after removing registry/namespace prefix)
+                    if image_name.ends_with(name) {
+                        // Verify it's a proper boundary (preceded by '/')
+                        let prefix = &image_name[..image_name.len() - name.len()];
+                        if prefix.is_empty() || prefix.ends_with('/') {
+                            return self.get_image(&entry.id);
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(StorageError::ImageNotFound(name.to_string()))
+    }
+}
+
+/// Entry in images.json for image name lookups.
+#[derive(Debug, serde::Deserialize)]
+struct ImageEntry {
+    id: String,
+    names: Option<Vec<String>>,
 }
 
 #[cfg(test)]

@@ -277,8 +277,21 @@ fn list_images(storage: &Storage, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+/// Helper to open an image by ID or name.
+fn open_image_by_id_or_name(storage: &Storage, image_ref: &str) -> Result<Image> {
+    // First try direct ID lookup
+    if let Ok(image) = Image::open(storage, image_ref) {
+        return Ok(image);
+    }
+
+    // Fall back to name lookup
+    storage
+        .find_image_by_name(image_ref)
+        .with_context(|| format!("image not found: {}", image_ref))
+}
+
 fn inspect_image(storage: &Storage, image_id: &str, show_layers: bool) -> Result<()> {
-    let image = Image::open(storage, image_id).context("Failed to open image")?;
+    let image = open_image_by_id_or_name(storage, image_id)?;
 
     println!("Image: {}", image.id());
 
@@ -300,7 +313,7 @@ fn inspect_image(storage: &Storage, image_id: &str, show_layers: bool) -> Result
 }
 
 fn list_layers(storage: &Storage, image_id: &str) -> Result<()> {
-    let image = Image::open(storage, image_id).context("Failed to open image")?;
+    let image = open_image_by_id_or_name(storage, image_id)?;
 
     let layers = storage
         .get_image_layers(&image)
@@ -397,7 +410,7 @@ fn export_layer(storage: &Storage, layer_id: &str, output: Option<PathBuf>) -> R
 }
 
 fn copy_to_oci(storage: &Storage, image_id: &str, output: PathBuf) -> Result<()> {
-    let image = Image::open(storage, image_id).context("Failed to open image")?;
+    let image = open_image_by_id_or_name(storage, image_id)?;
 
     // Get layer IDs from the image config (diff_ids)
     let layer_ids = image.layers().context("Failed to get layer IDs")?;
@@ -542,7 +555,7 @@ fn reflink_to_dir(
     use cstor_rs::Toc;
     use std::collections::HashMap;
 
-    let image = Image::open(storage, image_id).context("Failed to open image")?;
+    let image = open_image_by_id_or_name(storage, image_id)?;
 
     // Require parent directory to exist, but destination must not exist
     if dest.exists() {
@@ -716,7 +729,7 @@ fn extract_toc_entry(
 fn output_toc(storage: &Storage, image_id: &str, pretty: bool) -> Result<()> {
     use cstor_rs::Toc;
 
-    let image = Image::open(storage, image_id).context("Failed to open image")?;
+    let image = open_image_by_id_or_name(storage, image_id)?;
     let toc = Toc::from_image(storage, &image).context("Failed to build TOC")?;
 
     let json = if pretty {
