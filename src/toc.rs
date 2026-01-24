@@ -658,7 +658,7 @@ impl Toc {
     /// # Ok::<(), cstor_rs::StorageError>(())
     /// ```
     pub fn from_image(storage: &Storage, image: &crate::image::Image) -> Result<Self> {
-        let layer_ids = image.layers()?;
+        let layer_ids = image.storage_layer_ids(storage)?;
         let mut merged = Self::new();
 
         // Process layers in order (base to top), merging with whiteout handling
@@ -697,7 +697,7 @@ impl Toc {
         storage: &Storage,
         image: &crate::image::Image,
     ) -> Result<(Self, HashMap<PathBuf, String>)> {
-        let layer_ids = image.layers()?;
+        let layer_ids = image.storage_layer_ids(storage)?;
 
         // Use a HashMap to store (TocEntry, layer_id) pairs.
         // This avoids the tree's limitation where directory entries conflict

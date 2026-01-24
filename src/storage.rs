@@ -410,6 +410,9 @@ impl Storage {
     /// Returns a vector of [`Layer`](crate::layer::Layer) instances corresponding
     /// to the image's layer stack, with the base layer first.
     ///
+    /// Note: This method resolves OCI diff_ids from the image config to the
+    /// actual storage layer IDs using the `layers.json` mapping file.
+    ///
     /// # Arguments
     ///
     /// * `image` - Reference to the Image to get layers for
@@ -436,9 +439,11 @@ impl Storage {
         image: &crate::image::Image,
     ) -> Result<Vec<crate::layer::Layer>> {
         use crate::layer::Layer;
-        let layer_ids = image.layers()?;
+        // image.layers() returns diff_ids, which need to be mapped to storage layer IDs
+        let diff_ids = image.layers()?;
         let mut layers = Vec::new();
-        for layer_id in layer_ids {
+        for diff_id in diff_ids {
+            let layer_id = self.resolve_diff_id(&diff_id)?;
             layers.push(Layer::open(self, &layer_id)?);
         }
         Ok(layers)
@@ -510,6 +515,98 @@ impl Storage {
 
         Err(StorageError::ImageNotFound(name.to_string()))
     }
+
+    /// Resolve a diff-digest to a storage layer ID.
+    ///
+    /// In containers-storage, layer directories are named with internal IDs,
+    /// not the OCI diff_ids from the image config. This method reads the
+    /// `overlay-layers/layers.json` file to find the layer with the matching
+    /// `diff-digest` and returns its storage ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `diff_digest` - The diff digest to look up (with or without "sha256:" prefix)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::LayerNotFound`] if no layer with the given diff-digest exists.
+    pub fn resolve_diff_id(&self, diff_digest: &str) -> Result<String> {
+        use std::io::Read;
+
+        // Normalize the diff_digest to include sha256: prefix for comparison
+        let normalized = if diff_digest.starts_with("sha256:") {
+            diff_digest.to_string()
+        } else {
+            format!("sha256:{}", diff_digest)
+        };
+
+        // Read layers.json from overlay-layers/
+        let layers_dir = self.root_dir.open_dir("overlay-layers")?;
+        let mut file = layers_dir.open("layers.json")?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+
+        // Parse the JSON array
+        let entries: Vec<LayerEntry> = serde_json::from_str(&contents)
+            .map_err(|e| StorageError::InvalidStorage(format!("Invalid layers.json: {}", e)))?;
+
+        // Search for matching diff-digest
+        for entry in entries {
+            if entry.diff_digest.as_ref() == Some(&normalized) {
+                return Ok(entry.id);
+            }
+        }
+
+        Err(StorageError::LayerNotFound(diff_digest.to_string()))
+    }
+
+    /// Get layer metadata including size information.
+    ///
+    /// Returns the layer entry from layers.json for the given layer ID.
+    pub fn get_layer_metadata(&self, layer_id: &str) -> Result<LayerMetadata> {
+        use std::io::Read;
+
+        // Read layers.json from overlay-layers/
+        let layers_dir = self.root_dir.open_dir("overlay-layers")?;
+        let mut file = layers_dir.open("layers.json")?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+
+        // Parse the JSON array
+        let entries: Vec<LayerEntry> = serde_json::from_str(&contents)
+            .map_err(|e| StorageError::InvalidStorage(format!("Invalid layers.json: {}", e)))?;
+
+        // Search for matching layer ID
+        for entry in entries {
+            if entry.id == layer_id {
+                return Ok(LayerMetadata {
+                    id: entry.id,
+                    parent: entry.parent,
+                    diff_size: entry.diff_size,
+                    compressed_size: entry.compressed_size,
+                });
+            }
+        }
+
+        Err(StorageError::LayerNotFound(layer_id.to_string()))
+    }
+
+    /// Calculate the total uncompressed size of an image.
+    ///
+    /// Walks through all layers and sums their diff_size values.
+    pub fn calculate_image_size(&self, image: &crate::image::Image) -> Result<u64> {
+        let layers = self.get_image_layers(image)?;
+        let mut total_size: u64 = 0;
+
+        for layer in &layers {
+            let metadata = self.get_layer_metadata(&layer.id)?;
+            if let Some(size) = metadata.diff_size {
+                total_size = total_size.saturating_add(size);
+            }
+        }
+
+        Ok(total_size)
+    }
 }
 
 /// Entry in images.json for image name lookups.
@@ -517,6 +614,30 @@ impl Storage {
 struct ImageEntry {
     id: String,
     names: Option<Vec<String>>,
+}
+
+/// Entry in layers.json for layer ID lookups.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct LayerEntry {
+    id: String,
+    parent: Option<String>,
+    diff_digest: Option<String>,
+    diff_size: Option<u64>,
+    compressed_size: Option<u64>,
+}
+
+/// Metadata about a layer from layers.json.
+#[derive(Debug, Clone)]
+pub struct LayerMetadata {
+    /// Layer storage ID.
+    pub id: String,
+    /// Parent layer ID (if not base layer).
+    pub parent: Option<String>,
+    /// Uncompressed diff size in bytes.
+    pub diff_size: Option<u64>,
+    /// Compressed size in bytes.
+    pub compressed_size: Option<u64>,
 }
 
 #[cfg(test)]

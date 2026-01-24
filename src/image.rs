@@ -164,7 +164,7 @@ impl Image {
     /// # Ok::<(), cstor_rs::StorageError>(())
     /// ```
     pub fn config(&self) -> Result<ImageConfiguration> {
-        use base64::{Engine, engine::general_purpose::STANDARD};
+        use base64::{engine::general_purpose::STANDARD, Engine};
 
         // The config is stored with key: sha256:<image-id>
         // Base64 encode: "sha256:<id>"
@@ -176,10 +176,11 @@ impl Image {
             .map_err(|e| StorageError::InvalidStorage(format!("Invalid config JSON: {}", e)))
     }
 
-    /// Get the layer IDs for this image in order (base to top).
+    /// Get the OCI diff_ids for this image in order (base to top).
     ///
     /// This returns the diff_ids from the image config, which are the uncompressed
-    /// tar digests that match the storage layer directory names.
+    /// tar digests. Note that these are **not** the same as the storage layer IDs!
+    /// To get the actual storage layer IDs, use [`storage_layer_ids()`](Self::storage_layer_ids).
     ///
     /// # Errors
     ///
@@ -192,17 +193,17 @@ impl Image {
     ///
     /// let storage = Storage::discover()?;
     /// let image = Image::open(&storage, "abc123...")?;
-    /// let layer_ids = image.layers()?;
-    /// for id in layer_ids {
-    ///     println!("Layer: {}", id);
+    /// let diff_ids = image.layers()?;
+    /// for id in diff_ids {
+    ///     println!("Diff ID: {}", id);
     /// }
     /// # Ok::<(), cstor_rs::StorageError>(())
     /// ```
     pub fn layers(&self) -> Result<Vec<String>> {
         let config = self.config()?;
 
-        // Extract layer IDs from diff_ids (these are the actual storage layer IDs)
-        let layer_ids: Vec<String> = config
+        // Extract diff_ids from config - these are NOT the storage layer IDs
+        let diff_ids: Vec<String> = config
             .rootfs()
             .diff_ids()
             .iter()
@@ -216,7 +217,43 @@ impl Image {
             })
             .collect();
 
-        Ok(layer_ids)
+        Ok(diff_ids)
+    }
+
+    /// Get the storage layer IDs for this image in order (base to top).
+    ///
+    /// Unlike [`layers()`](Self::layers) which returns OCI diff_ids, this method
+    /// returns the actual storage layer directory names by resolving diff_ids
+    /// through the `layers.json` mapping file.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - Reference to the Storage instance for layer lookup
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be read, parsed, or if any layer
+    /// cannot be resolved.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::{Storage, Image};
+    ///
+    /// let storage = Storage::discover()?;
+    /// let image = Image::open(&storage, "abc123...")?;
+    /// let layer_ids = image.storage_layer_ids(&storage)?;
+    /// for id in layer_ids {
+    ///     println!("Layer: {}", id);
+    /// }
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn storage_layer_ids(&self, storage: &Storage) -> Result<Vec<String>> {
+        let diff_ids = self.layers()?;
+        diff_ids
+            .iter()
+            .map(|diff_id| storage.resolve_diff_id(diff_id))
+            .collect()
     }
 
     /// Read additional metadata files.
@@ -286,6 +323,97 @@ impl Image {
     pub fn toc(&self, storage: &Storage) -> Result<crate::toc::Toc> {
         crate::toc::Toc::from_image(storage, self)
     }
+
+    /// Get the repository names/tags for this image.
+    ///
+    /// Reads from the `overlay-images/images.json` index file to find the
+    /// names associated with this image.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - Reference to the Storage instance
+    ///
+    /// # Returns
+    ///
+    /// Returns an empty vector if the image has no tags.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::{Storage, Image};
+    ///
+    /// let storage = Storage::discover()?;
+    /// let image = Image::open(&storage, "abc123...")?;
+    /// let names = image.names(&storage)?;
+    /// for name in names {
+    ///     println!("  {}", name);
+    /// }
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn names(&self, storage: &Storage) -> Result<Vec<String>> {
+        let images_dir = storage.root_dir().open_dir("overlay-images")?;
+        let mut file = images_dir.open("images.json")?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+
+        let entries: Vec<ImageJsonEntry> = serde_json::from_str(&contents)
+            .map_err(|e| StorageError::InvalidStorage(format!("Invalid images.json: {}", e)))?;
+
+        for entry in entries {
+            if entry.id == self.id {
+                return Ok(entry.names.unwrap_or_default());
+            }
+        }
+
+        // Image not found in images.json - return empty names
+        Ok(Vec::new())
+    }
+
+    /// Get the image creation time.
+    ///
+    /// Reads from the OCI image config and parses the RFC3339 timestamp.
+    ///
+    /// # Returns
+    ///
+    /// Returns `None` if the image config has no creation timestamp.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::{Storage, Image};
+    ///
+    /// let storage = Storage::discover()?;
+    /// let image = Image::open(&storage, "abc123...")?;
+    /// if let Some(created) = image.created()? {
+    ///     println!("Created: {}", created);
+    /// }
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn created(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let config = self.config()?;
+
+        match config.created() {
+            Some(created_str) => {
+                let dt = chrono::DateTime::parse_from_rfc3339(created_str)
+                    .map_err(|e| {
+                        StorageError::InvalidStorage(format!(
+                            "Invalid created timestamp '{}': {}",
+                            created_str, e
+                        ))
+                    })?
+                    .with_timezone(&chrono::Utc);
+                Ok(Some(dt))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// Entry in images.json for image name lookups.
+#[derive(Debug, serde::Deserialize)]
+struct ImageJsonEntry {
+    id: String,
+    names: Option<Vec<String>>,
 }
 
 #[cfg(test)]

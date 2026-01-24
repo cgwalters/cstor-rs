@@ -26,11 +26,18 @@
 //! To disable this behavior (e.g., for debugging), set `CSTOR_IN_USERNS=1`
 //! before running the command.
 
+mod output;
+mod table;
+
 use anyhow::{Context, Result, anyhow};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, Permissions};
 use clap::{Parser, Subcommand};
 use cstor_rs::*;
+use output::{
+    format_time_ago, output_item, output_slice, ImageInspectOutput, ImageListEntry, LayerInfo,
+    LayerInspectOutput, OutputFormat, truncate_id,
+};
 use sha2::Digest;
 use std::fs::File;
 use std::io::{self, Write};
@@ -45,7 +52,7 @@ const USERNS_ENV: &str = "CSTOR_IN_USERNS";
 
 #[derive(Parser)]
 #[command(name = "cstor-rs")]
-#[command(about = "Read and manipulate containers-storage (overlay driver)", long_about = None)]
+#[command(about = "Read-only access to containers-storage (overlay driver)", long_about = None)]
 struct Cli {
     /// Path to storage root (default: auto-discover)
     #[arg(short, long, global = true)]
@@ -57,59 +64,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List all images in storage
-    ListImages {
-        /// Show detailed information
-        #[arg(short, long)]
-        verbose: bool,
+    /// Manage images
+    #[command(visible_alias = "images")]
+    Image {
+        #[command(subcommand)]
+        command: ImageCommands,
     },
 
-    /// Show information about a specific image
-    InspectImage {
-        /// Image ID or name
-        image_id: String,
-
-        /// Show layers
-        #[arg(short, long)]
-        layers: bool,
-    },
-
-    /// List layers for an image
-    ListLayers {
-        /// Image ID
-        image_id: String,
-    },
-
-    /// Inspect a specific layer
-    InspectLayer {
-        /// Layer ID
-        layer_id: String,
-
-        /// Show parent chain
-        #[arg(short, long)]
-        chain: bool,
-    },
-
-    /// Export layer as tar stream
-    ExportLayer {
-        /// Layer ID
-        layer_id: String,
-
-        /// Output file (default: stdout)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
-
-    /// Copy image to OCI directory layout
-    ///
-    /// This command reassembles tar streams from file descriptors,
-    /// demonstrating zero-copy access to layer content.
-    CopyToOci {
-        /// Image ID
-        image_id: String,
-
-        /// Output OCI directory
-        output: PathBuf,
+    /// Manage layers
+    #[command(visible_alias = "layers")]
+    Layer {
+        #[command(subcommand)]
+        command: LayerCommands,
     },
 
     /// Resolve a link ID to layer ID
@@ -117,55 +83,111 @@ enum Commands {
         /// Short link ID (26 chars)
         link_id: String,
     },
+}
+
+/// Image subcommands
+#[derive(Subcommand)]
+enum ImageCommands {
+    /// List images in storage
+    #[command(visible_alias = "ls")]
+    List {
+        /// Output format (table or json)
+        #[arg(long, value_enum, default_value = "table")]
+        format: OutputFormat,
+        /// Don't truncate image IDs
+        #[arg(long)]
+        no_trunc: bool,
+    },
+
+    /// Display detailed information on an image
+    Inspect {
+        /// Image ID or name
+        image: String,
+        /// Output format (table or json)
+        #[arg(long, value_enum, default_value = "table")]
+        format: OutputFormat,
+    },
+
+    /// List layers for an image
+    Layers {
+        /// Image ID or name
+        image: String,
+        /// Output format (table or json)
+        #[arg(long, value_enum, default_value = "table")]
+        format: OutputFormat,
+    },
+
+    /// Output Table of Contents (TOC) for an image
+    ///
+    /// The TOC contains metadata for all files across all layers,
+    /// in a format compatible with eStargz.
+    Toc {
+        /// Image ID or name
+        image: String,
+        /// Pretty-print the JSON output
+        #[arg(long)]
+        pretty: bool,
+    },
+
+    /// Copy image to OCI directory layout
+    #[command(visible_alias = "copy")]
+    CopyToOci {
+        /// Image ID or name
+        image: String,
+        /// Output OCI directory
+        output: PathBuf,
+    },
 
     /// Extract image to directory using reflinks
     ///
     /// Flattens all layers and extracts to the destination directory.
     /// Files are reflinked from the source storage when possible,
     /// avoiding data duplication on filesystems that support it (btrfs, XFS).
-    ReflinkToDir {
-        /// Image ID
-        image_id: String,
-
+    Extract {
+        /// Image ID or name
+        image: String,
         /// Destination directory (must not exist)
         output: PathBuf,
-
         /// Fall back to copying if reflinks are not supported
         #[arg(long)]
         force_copy: bool,
-
         /// Use splitfdstream path for extraction (experimental)
-        ///
-        /// Instead of using the TOC-based approach, this uses splitfdstream
-        /// to get file descriptors for layer content. The splitfdstream
-        /// encodes tar metadata inline and references file content via fds.
         #[arg(long)]
         use_splitfdstream: bool,
     },
+}
 
-    /// Output Table of Contents (TOC) for an image as JSON
-    ///
-    /// The TOC contains metadata for all files across all layers,
-    /// in a format compatible with eStargz.
-    Toc {
-        /// Image ID
-        image_id: String,
-
-        /// Pretty-print the JSON output
-        #[arg(long)]
-        pretty: bool,
+/// Layer subcommands
+#[derive(Subcommand)]
+enum LayerCommands {
+    /// Display detailed information on a layer
+    Inspect {
+        /// Layer ID
+        layer: String,
+        /// Show parent chain
+        #[arg(short, long)]
+        chain: bool,
+        /// Output format (table or json)
+        #[arg(long, value_enum, default_value = "table")]
+        format: OutputFormat,
     },
 
-    /// Export layer as tar stream via IPC protocol (PoC)
-    ///
-    /// This command demonstrates the JSON-RPC fd-passing protocol
-    /// by streaming tar-split data through a socketpair internally.
-    /// The server sends NDJSON messages with fds, and the client
-    /// reconstructs the tar archive.
-    ExportLayerIpc {
+    /// Export layer as tar stream
+    Export {
         /// Layer ID
-        layer_id: String,
+        layer: String,
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 
+    /// Export layer as tar stream via IPC protocol (experimental)
+    ///
+    /// Demonstrates the JSON-RPC fd-passing protocol by streaming
+    /// tar-split data through a socketpair internally.
+    ExportIpc {
+        /// Layer ID
+        layer: String,
         /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -214,17 +236,8 @@ fn reexec_in_userns() -> Result<std::convert::Infallible> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Check if this command needs user namespace access for file content
-    let needs_file_access = matches!(
-        cli.command,
-        Commands::ExportLayer { .. }
-            | Commands::CopyToOci { .. }
-            | Commands::ReflinkToDir { .. }
-            | Commands::ExportLayerIpc { .. }
-    );
-
-    // Re-exec via podman unshare if needed
-    if needs_file_access && needs_userns() {
+    // Re-exec via podman unshare if needed for proper UID/GID mapping
+    if needs_userns() {
         reexec_in_userns()?;
     }
 
@@ -236,61 +249,139 @@ fn main() -> Result<()> {
     };
 
     match cli.command {
-        Commands::ListImages { verbose } => list_images(&storage, verbose)?,
-        Commands::InspectImage { image_id, layers } => inspect_image(&storage, &image_id, layers)?,
-        Commands::ListLayers { image_id } => list_layers(&storage, &image_id)?,
-        Commands::InspectLayer { layer_id, chain } => inspect_layer(&storage, &layer_id, chain)?,
-        Commands::ExportLayer { layer_id, output } => export_layer(&storage, &layer_id, output)?,
-        Commands::CopyToOci { image_id, output } => copy_to_oci(&storage, &image_id, output)?,
+        Commands::Image { command } => match command {
+            ImageCommands::List { format, no_trunc } => list_images(&storage, format, no_trunc)?,
+            ImageCommands::Inspect { image, format } => inspect_image(&storage, &image, format)?,
+            ImageCommands::Layers { image, format } => list_layers(&storage, &image, format)?,
+            ImageCommands::Toc { image, pretty } => output_toc(&storage, &image, pretty)?,
+            ImageCommands::CopyToOci { image, output } => copy_to_oci(&storage, &image, output)?,
+            ImageCommands::Extract {
+                image,
+                output,
+                force_copy,
+                use_splitfdstream,
+            } => reflink_to_dir(&storage, &image, output, force_copy, use_splitfdstream)?,
+        },
+        Commands::Layer { command } => match command {
+            LayerCommands::Inspect { layer, chain, format } => {
+                inspect_layer(&storage, &layer, chain, format)?
+            }
+            LayerCommands::Export { layer, output } => export_layer(&storage, &layer, output)?,
+            LayerCommands::ExportIpc { layer, output } => {
+                export_layer_ipc(&storage, &layer, output)?
+            }
+        },
         Commands::ResolveLink { link_id } => resolve_link(&storage, &link_id)?,
-        Commands::ReflinkToDir {
-            image_id,
-            output,
-            force_copy,
-            use_splitfdstream,
-        } => reflink_to_dir(&storage, &image_id, output, force_copy, use_splitfdstream)?,
-        Commands::Toc { image_id, pretty } => output_toc(&storage, &image_id, pretty)?,
-        Commands::ExportLayerIpc { layer_id, output } => {
-            export_layer_ipc(&storage, &layer_id, output)?
-        }
     }
 
     Ok(())
 }
 
-fn list_images(storage: &Storage, verbose: bool) -> Result<()> {
+/// Parse a full image name into (repository, tag).
+///
+/// Splits on the last `:` to handle names like `docker.io/library/alpine:latest`.
+/// If no `:` is found, returns the full name as repository with tag "<none>".
+fn parse_repo_tag(name: &str) -> (String, String) {
+    // Find the last colon, but be careful about ports in registry URLs
+    // e.g., "localhost:5000/image:tag" should split as ("localhost:5000/image", "tag")
+    // A tag can only appear after the last `/` segment
+    if let Some(last_slash) = name.rfind('/') {
+        let after_slash = &name[last_slash + 1..];
+        if let Some(colon_offset) = after_slash.rfind(':') {
+            let colon_pos = last_slash + 1 + colon_offset;
+            return (name[..colon_pos].to_string(), name[colon_pos + 1..].to_string());
+        }
+    } else if let Some(colon_pos) = name.rfind(':') {
+        // No slash, simple case like "alpine:latest"
+        return (name[..colon_pos].to_string(), name[colon_pos + 1..].to_string());
+    }
+    // No tag found
+    (name.to_string(), "<none>".to_string())
+}
+
+fn list_images(storage: &Storage, format: OutputFormat, no_trunc: bool) -> Result<()> {
     let images = storage.list_images().context("Failed to list images")?;
 
-    println!("Found {} images", images.len());
+    let mut entries: Vec<ImageListEntry> = Vec::with_capacity(images.len());
 
     for image in &images {
-        println!("\n{}", image.id());
+        let names = image.names(storage).unwrap_or_default();
+        let size = storage.calculate_image_size(image).unwrap_or(0);
+        let created = image.created().ok().flatten();
+        let manifest = image.manifest().context("Failed to read manifest")?;
+        let layer_count = manifest.layers().len();
 
-        if verbose {
-            let manifest = image.manifest().context("Failed to read manifest")?;
-            println!("  Schema: {}", manifest.schema_version());
-            if let Some(media_type) = manifest.media_type() {
-                println!("  Media type: {}", media_type);
-            }
-            let layers = manifest.layers();
-            println!("  Layers: {}", layers.len());
-            for (i, layer) in layers.iter().take(3).enumerate() {
-                println!("    {}: {} ({} bytes)", i + 1, layer.digest(), layer.size());
-            }
-            if layers.len() > 3 {
-                println!("    ... and {} more layers", layers.len() - 3);
+        let full_id = image.id().to_string();
+        let id = if no_trunc {
+            full_id.clone()
+        } else {
+            truncate_id(&full_id)
+        };
+
+        // Pre-format the creation time for display
+        let created_display = created
+            .map(format_time_ago)
+            .unwrap_or_else(|| "N/A".to_string());
+
+        if names.is_empty() {
+            // No names - show as <none>:<none>
+            entries.push(ImageListEntry {
+                repository: "<none>".to_string(),
+                tag: "<none>".to_string(),
+                id: id.clone(),
+                full_id: full_id.clone(),
+                created: created_display.clone(),
+                size,
+                layers: layer_count,
+            });
+        } else {
+            // Create an entry for each name
+            for name in &names {
+                let (repository, tag) = parse_repo_tag(name);
+                entries.push(ImageListEntry {
+                    repository,
+                    tag,
+                    id: id.clone(),
+                    full_id: full_id.clone(),
+                    created: created_display.clone(),
+                    size,
+                    layers: layer_count,
+                });
             }
         }
     }
 
+    output_slice(&entries, format).context("Failed to output images")?;
+
     Ok(())
 }
 
-/// Helper to open an image by ID or name.
+/// Helper to open an image by ID (full or prefix) or name.
 fn open_image_by_id_or_name(storage: &Storage, image_ref: &str) -> Result<Image> {
-    // First try direct ID lookup
+    // First try direct ID lookup (full ID)
     if let Ok(image) = Image::open(storage, image_ref) {
         return Ok(image);
+    }
+
+    // Try prefix matching on image IDs
+    if image_ref.len() >= 3 {
+        let images = storage.list_images().context("Failed to list images")?;
+        let matches: Vec<_> = images
+            .into_iter()
+            .filter(|img| img.id().starts_with(image_ref))
+            .collect();
+
+        match matches.len() {
+            1 => return Ok(matches.into_iter().next().unwrap()),
+            n if n > 1 => {
+                anyhow::bail!(
+                    "ambiguous image ID prefix '{}' matches {} images",
+                    image_ref,
+                    n
+                );
+            }
+            _ => {}
+        }
     }
 
     // Fall back to name lookup
@@ -299,73 +390,167 @@ fn open_image_by_id_or_name(storage: &Storage, image_ref: &str) -> Result<Image>
         .with_context(|| format!("image not found: {}", image_ref))
 }
 
-fn inspect_image(storage: &Storage, image_id: &str, show_layers: bool) -> Result<()> {
-    let image = open_image_by_id_or_name(storage, image_id)?;
-
-    println!("Image: {}", image.id());
-
-    let manifest = image.manifest().context("Failed to read manifest")?;
-    println!("Schema version: {}", manifest.schema_version());
-    if let Some(media_type) = manifest.media_type() {
-        println!("Media type: {}", media_type);
-    }
-    println!("Config: {}", manifest.config().digest());
-    println!("\nLayers: {}", manifest.layers().len());
-
-    if show_layers {
-        for (i, layer) in manifest.layers().iter().enumerate() {
-            println!("  {}: {} ({} bytes)", i + 1, layer.digest(), layer.size());
-        }
+/// Helper to open a layer by ID (full or prefix) or link ID.
+fn open_layer_by_id_or_link(storage: &Storage, layer_ref: &str) -> Result<Layer> {
+    // First try direct ID lookup (full ID)
+    if let Ok(layer) = Layer::open(storage, layer_ref) {
+        return Ok(layer);
     }
 
-    Ok(())
-}
-
-fn list_layers(storage: &Storage, image_id: &str) -> Result<()> {
-    let image = open_image_by_id_or_name(storage, image_id)?;
-
-    let layers = storage
-        .get_image_layers(&image)
-        .context("Failed to get image layers")?;
-
-    println!("Image {} has {} layers:", image.id(), layers.len());
-
-    for (i, layer) in layers.iter().enumerate() {
-        println!("\n  Layer {}: {}", i + 1, layer.id);
-        println!("    Link ID: {}", layer.link_id());
-        let parent_links = layer.parent_links();
-        if !parent_links.is_empty() {
-            println!("    Parents: {}", parent_links.len());
-        }
-    }
-
-    Ok(())
-}
-
-fn inspect_layer(storage: &Storage, layer_id: &str, show_chain: bool) -> Result<()> {
-    let layer = Layer::open(storage, layer_id).context("Failed to open layer")?;
-
-    println!("Layer: {}", layer.id);
-    println!("Link ID: {}", layer.link_id());
-
-    let parent_links = layer.parent_links();
-    println!("Parents: {}", parent_links.len());
-
-    if show_chain && !parent_links.is_empty() {
-        println!("\nParent chain:");
-        for (i, link_id) in parent_links.iter().enumerate() {
-            match storage.resolve_link(link_id) {
-                Ok(parent_id) => println!("  {}: {}", i + 1, parent_id),
-                Err(e) => println!("  {}: {} (error: {})", i + 1, link_id, e),
+    // Try resolving as a link ID (base32, 26 chars)
+    if layer_ref.len() == 26 && layer_ref.chars().all(|c| c.is_ascii_alphanumeric()) {
+        if let Ok(layer_id) = storage.resolve_link(layer_ref) {
+            if let Ok(layer) = Layer::open(storage, &layer_id) {
+                return Ok(layer);
             }
         }
     }
 
+    // Try prefix matching on layer IDs
+    if layer_ref.len() >= 3 {
+        let overlay_dir = storage
+            .root_dir()
+            .open_dir("overlay")
+            .context("Failed to open overlay directory")?;
+
+        let mut matches: Vec<String> = Vec::new();
+        for entry in overlay_dir.entries().context("Failed to read overlay directory")? {
+            let entry = entry.context("Failed to read directory entry")?;
+            if entry.file_type()?.is_dir() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                // Skip the 'l' directory (link directory)
+                if name_str != "l" && name_str.starts_with(layer_ref) {
+                    matches.push(name_str.to_string());
+                }
+            }
+        }
+
+        match matches.len() {
+            1 => return Layer::open(storage, &matches[0]).context("Failed to open layer"),
+            n if n > 1 => {
+                anyhow::bail!(
+                    "ambiguous layer ID prefix '{}' matches {} layers",
+                    layer_ref,
+                    n
+                );
+            }
+            _ => {}
+        }
+    }
+
+    anyhow::bail!("layer not found: {}", layer_ref)
+}
+
+fn inspect_image(storage: &Storage, image_id: &str, format: OutputFormat) -> Result<()> {
+    let image = open_image_by_id_or_name(storage, image_id)?;
+
+    let manifest = image.manifest().context("Failed to read manifest")?;
+    let names = image.names(storage).unwrap_or_default();
+    let size = storage.calculate_image_size(&image).unwrap_or(0);
+    let created = image.created().ok().flatten();
+
+    // Build layer info
+    let storage_layers = storage
+        .get_image_layers(&image)
+        .context("Failed to get image layers")?;
+
+    let layer_count = storage_layers.len();
+
+    // Pre-format for display
+    let created_display = created
+        .map(format_time_ago)
+        .unwrap_or_else(|| "N/A".to_string());
+
+    let output = ImageInspectOutput {
+        id: image.id().to_string(),
+        repo_tags: names.join(", "),
+        created: created_display,
+        size,
+        schema_version: manifest.schema_version(),
+        media_type: manifest.media_type().as_ref().map(|s| s.to_string()),
+        config_digest: manifest.config().digest().to_string(),
+        layer_count,
+    };
+
+    output_item(&output, format).context("Failed to output image")?;
+
     Ok(())
 }
 
-fn export_layer(storage: &Storage, layer_id: &str, output: Option<PathBuf>) -> Result<()> {
-    let layer = Layer::open(storage, layer_id).context("Failed to open layer")?;
+fn list_layers(storage: &Storage, image_id: &str, format: OutputFormat) -> Result<()> {
+    let image = open_image_by_id_or_name(storage, image_id)?;
+
+    let storage_layers = storage
+        .get_image_layers(&image)
+        .context("Failed to get image layers")?;
+
+    let layers: Vec<LayerInfo> = storage_layers
+        .iter()
+        .enumerate()
+        .map(|(i, layer)| {
+            let diff_size = storage
+                .get_layer_metadata(&layer.id)
+                .ok()
+                .and_then(|m| m.diff_size);
+            LayerInfo {
+                index: i,
+                id: truncate_id(&layer.id),
+                full_id: layer.id.clone(),
+                link_id: layer.link_id().to_string(),
+                parent_count: layer.parent_links().len(),
+                diff_size,
+            }
+        })
+        .collect();
+
+    output_slice(&layers, format).context("Failed to output layers")?;
+
+    Ok(())
+}
+
+fn inspect_layer(
+    storage: &Storage,
+    layer_ref: &str,
+    show_chain: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let layer = open_layer_by_id_or_link(storage, layer_ref)?;
+
+    let metadata = storage.get_layer_metadata(&layer.id).ok();
+    let parent_links = layer.parent_links();
+
+    // Build parent chain if requested (as newline-separated string for display)
+    let parent_chain: Option<String> = if show_chain {
+        let chain: Vec<String> = parent_links
+            .iter()
+            .filter_map(|link_id| storage.resolve_link(link_id).ok())
+            .collect();
+        if chain.is_empty() {
+            None
+        } else {
+            Some(chain.join("\n"))
+        }
+    } else {
+        None
+    };
+
+    let info = LayerInspectOutput {
+        id: layer.id.clone(),
+        link_id: layer.link_id().to_string(),
+        parent_count: parent_links.len(),
+        diff_size: metadata.as_ref().and_then(|m| m.diff_size),
+        compressed_size: metadata.as_ref().and_then(|m| m.compressed_size),
+        parent_chain,
+    };
+
+    output_item(&info, format).context("Failed to output layer info")?;
+
+    Ok(())
+}
+
+fn export_layer(storage: &Storage, layer_ref: &str, output: Option<PathBuf>) -> Result<()> {
+    let layer = open_layer_by_id_or_link(storage, layer_ref)?;
 
     let mut stream =
         TarSplitFdStream::new(storage, &layer).context("Failed to create tar-split stream")?;
@@ -413,7 +598,7 @@ fn export_layer(storage: &Storage, layer_id: &str, output: Option<PathBuf>) -> R
         }
     }
 
-    eprintln!("Exported {} file entries from layer {}", count, layer_id);
+    eprintln!("Exported {} file entries from layer {}", count, layer.id);
 
     Ok(())
 }
@@ -421,8 +606,8 @@ fn export_layer(storage: &Storage, layer_id: &str, output: Option<PathBuf>) -> R
 fn copy_to_oci(storage: &Storage, image_id: &str, output: PathBuf) -> Result<()> {
     let image = open_image_by_id_or_name(storage, image_id)?;
 
-    // Get layer IDs from the image config (diff_ids)
-    let layer_ids = image.layers().context("Failed to get layer IDs")?;
+    // Get storage layer IDs (resolved from diff_ids via layers.json)
+    let layer_ids = image.storage_layer_ids(storage).context("Failed to get layer IDs")?;
 
     // Create output directory structure
     std::fs::create_dir_all(&output).context("Failed to create output directory")?;
@@ -642,7 +827,7 @@ fn reflink_to_dir_splitfdstream(
     use cstor_rs::splitfdstream::extract_to_dir;
     use cstor_rs::{DEFAULT_INLINE_THRESHOLD, layer_to_splitfdstream};
 
-    let layer_ids = image.layers().context("Failed to get layer IDs")?;
+    let layer_ids = image.storage_layer_ids(storage).context("Failed to get layer IDs")?;
 
     eprintln!(
         "Extracting {} layers to {} (using splitfdstream)",
@@ -861,7 +1046,7 @@ fn output_toc(storage: &Storage, image_id: &str, pretty: bool) -> Result<()> {
 /// 5. Reconstructing the tar from splitfdstream + fds
 ///
 /// This validates that the wire format works correctly over Unix sockets.
-fn export_layer_ipc(storage: &Storage, layer_id: &str, output: Option<PathBuf>) -> Result<()> {
+fn export_layer_ipc(storage: &Storage, layer_ref: &str, output: Option<PathBuf>) -> Result<()> {
     use cstor_rs::protocol::GetLayerSplitfdstreamParams;
     use cstor_rs::server::RpcServer;
     use cstor_rs::splitfdstream::reconstruct_tar_seekable;
@@ -870,8 +1055,9 @@ fn export_layer_ipc(storage: &Storage, layer_id: &str, output: Option<PathBuf>) 
     use std::io::Read;
     use tokio::net::UnixStream;
 
-    // Validate the layer exists before setting up IPC
-    let _layer = Layer::open(storage, layer_id).context("Failed to open layer")?;
+    // Validate the layer exists and resolve to full ID before setting up IPC
+    let layer = open_layer_by_id_or_link(storage, layer_ref)?;
+    let layer_id = layer.id.clone();
 
     // For the server task, we need to re-discover storage since Storage is not Clone.
     // This is acceptable for a PoC - in production, the server would be a separate process.

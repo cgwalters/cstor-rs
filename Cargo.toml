@@ -22,6 +22,9 @@ oci-spec = "0.8.3"
 ocidir = "0.6.0"
 camino = "1.2.1"
 rustix = { version = "0.38", features = ["fs", "process"] }
+comfy-table = "7.2"
+facet = { version = "0.43", features = ["reflect"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 tracing = "0.1"
 tokio = { version = "1.40", features = ["full"] }
 jsonrpc-fdpass = { git = "https://github.com/cgwalters/jsonrpc-fdpass", rev = "c8b4aa54afa433541d83f1cb5436b44842a21e68" }
@@ -31,7 +34,7 @@ tempfile = "3.0"
 
 [[bin]]
 name = "cstor-rs"
-path = "src/bin/cli.rs"
+path = "src/bin/cli/main.rs"
 
 [[bin]]
 name = "tar-diff"

@@ -103,7 +103,7 @@ pub use error::{Result, StorageError};
 pub use generic_tree::{FileSystem, Inode, TreeError};
 pub use image::Image;
 pub use layer::Layer;
-pub use storage::Storage;
+pub use storage::{LayerMetadata, Storage};
 pub use tar_split::{
     DEFAULT_INLINE_THRESHOLD, LayerSplitfdstream, TarHeader, TarSplitFdStream, TarSplitItem,
     layer_to_splitfdstream,

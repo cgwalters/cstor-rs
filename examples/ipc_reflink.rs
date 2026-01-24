@@ -62,8 +62,8 @@ async fn main() -> Result<()> {
     let image = Image::open(&storage, image_id).context("Failed to open image")?;
     println!("Found image: {}", image.id());
 
-    // Get layer IDs
-    let layer_ids = image.layers().context("Failed to get layers")?;
+    // Get storage layer IDs (resolved from diff_ids via layers.json)
+    let layer_ids = image.storage_layer_ids(&storage).context("Failed to get layers")?;
     println!("Image has {} layer(s)", layer_ids.len());
 
     // Create destination directory
