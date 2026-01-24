@@ -1,228 +1,41 @@
-//! JSON-RPC protocol definitions for tar-split streaming with fd passing.
+//! JSON-RPC protocol definitions for splitfdstream layer access.
 //!
-//! This module defines the wire format for the NDJSON-RPC-FD protocol used to
-//! stream tar-split metadata with file descriptor passing over Unix sockets.
+//! This module defines the wire format for the JSON-RPC with FD passing protocol
+//! used to stream layer content with file descriptor passing over Unix sockets.
 //!
-//! # Wire Format
+//! # Protocol Overview
 //!
-//! The protocol uses NDJSON (newline-delimited JSON) with file descriptors
-//! passed via `SCM_RIGHTS` ancillary data. Each message is a complete JSON
-//! object on a single line.
+//! The protocol uses JSON-RPC 2.0 with file descriptors passed via `SCM_RIGHTS`
+//! ancillary data. The `fds` field in messages indicates how many file descriptors
+//! accompany the message.
 //!
-//! # Message Types
+//! # Example: GetLayerSplitfdstream
 //!
-//! The streaming protocol uses these message types:
-//! - `start`: Stream header with optional segments_fd
-//! - `seg`: Segment data (raw tar header/padding bytes)
-//! - `file`: File entry with fd for content
-//! - `end`: Stream complete
-//!
-//! # Example Stream
-//!
-//! ```text
-//! {"type":"start"}
-//! {"type":"seg","data":"<base64 tar header>"}
-//! {"type":"file","name":"usr/bin/bash","size":1234567,"fd":{"__jsonrpc_fd__":true,"index":0}}
-//! {"type":"seg","data":"<base64 padding>"}
-//! {"type":"end"}
+//! Request:
+//! ```json
+//! {"jsonrpc":"2.0","method":"GetLayerSplitfdstream","params":{"layer":"sha256:..."},"id":1}
 //! ```
+//!
+//! Response:
+//! ```json
+//! {"jsonrpc":"2.0","result":{"mediaType":"application/vnd.containers.splitfdstream"},"id":1,"fds":47}
+//! ```
+//!
+//! Where fd\[0\] is the splitfdstream and fd\[1..n\] are the external file contents.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
-// Re-export FileDescriptorPlaceholder from ndjson-rpc-fdpass as FdPlaceholder for compatibility
-pub use ndjson_rpc_fdpass::FileDescriptorPlaceholder as FdPlaceholder;
 
 // Re-export JSON-RPC types from the crate
-pub use ndjson_rpc_fdpass::{
+pub use jsonrpc_fdpass::{
     JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
     MessageWithFds,
 };
 
-/// Stream message types for tar-split streaming.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum StreamMessage {
-    /// Stream start message.
-    Start {
-        /// Optional fd for concatenated segment data (alternative to inline base64)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        segments_fd: Option<FdPlaceholder>,
-    },
+/// Media type for uncompressed splitfdstream.
+pub const SPLITFDSTREAM_MEDIA_TYPE: &str = "application/vnd.containers.splitfdstream";
 
-    /// Raw segment data (tar header, padding, footer).
-    ///
-    /// Contains base64-encoded bytes from tar-split that must be written
-    /// directly to reconstruct the tar archive bit-for-bit.
-    Seg {
-        /// Base64-encoded segment bytes
-        data: String,
-    },
-
-    /// File entry with content fd.
-    ///
-    /// The client should read `size` bytes from the passed fd.
-    File {
-        /// File path in the tar archive
-        name: String,
-        /// File size in bytes
-        size: u64,
-        /// Content digests (algorithm -> hex digest)
-        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-        digests: HashMap<String, String>,
-        /// File descriptor placeholder for content
-        fd: FdPlaceholder,
-    },
-
-    /// Stream end marker.
-    End,
-}
-
-/// Error returned when parsing a notification into a StreamMessage fails.
-#[derive(Debug, Clone)]
-pub struct ParseError {
-    /// Description of the error
-    pub message: String,
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for ParseError {}
-
-impl StreamMessage {
-    /// Convert to JSON-RPC notification method name.
-    pub fn method_name(&self) -> &'static str {
-        match self {
-            StreamMessage::Start { .. } => "stream.start",
-            StreamMessage::Seg { .. } => "stream.seg",
-            StreamMessage::File { .. } => "stream.file",
-            StreamMessage::End => "stream.end",
-        }
-    }
-
-    /// Convert to notification params (serde_json::Value).
-    pub fn to_params(&self) -> serde_json::Value {
-        // Serialize the full message, then extract the inner fields
-        // (the "type" tag is not needed in params since method encodes it)
-        match self {
-            StreamMessage::Start { segments_fd } => {
-                let mut map = serde_json::Map::new();
-                if let Some(fd) = segments_fd {
-                    map.insert("segments_fd".to_string(), serde_json::to_value(fd).unwrap());
-                }
-                serde_json::Value::Object(map)
-            }
-            StreamMessage::Seg { data } => {
-                serde_json::json!({ "data": data })
-            }
-            StreamMessage::File {
-                name,
-                size,
-                digests,
-                fd,
-            } => {
-                let mut map = serde_json::Map::new();
-                map.insert("name".to_string(), serde_json::Value::String(name.clone()));
-                map.insert("size".to_string(), serde_json::json!(size));
-                if !digests.is_empty() {
-                    map.insert(
-                        "digests".to_string(),
-                        serde_json::to_value(digests).unwrap(),
-                    );
-                }
-                map.insert("fd".to_string(), serde_json::to_value(fd).unwrap());
-                serde_json::Value::Object(map)
-            }
-            StreamMessage::End => serde_json::Value::Object(serde_json::Map::new()),
-        }
-    }
-
-    /// Parse from notification method and params.
-    pub fn from_notification(
-        method: &str,
-        params: Option<serde_json::Value>,
-    ) -> Result<Self, ParseError> {
-        let params = params.unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-
-        match method {
-            "stream.start" => {
-                let segments_fd = params
-                    .get("segments_fd")
-                    .map(|v| {
-                        serde_json::from_value(v.clone()).map_err(|e| ParseError {
-                            message: format!("invalid segments_fd: {}", e),
-                        })
-                    })
-                    .transpose()?;
-                Ok(StreamMessage::Start { segments_fd })
-            }
-            "stream.seg" => {
-                let data = params
-                    .get("data")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ParseError {
-                        message: "missing 'data' field in seg message".to_string(),
-                    })?
-                    .to_string();
-                Ok(StreamMessage::Seg { data })
-            }
-            "stream.file" => {
-                let name = params
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ParseError {
-                        message: "missing 'name' field in file message".to_string(),
-                    })?
-                    .to_string();
-                let size =
-                    params
-                        .get("size")
-                        .and_then(|v| v.as_u64())
-                        .ok_or_else(|| ParseError {
-                            message: "missing or invalid 'size' field in file message".to_string(),
-                        })?;
-                let digests: HashMap<String, String> = params
-                    .get("digests")
-                    .map(|v| {
-                        serde_json::from_value(v.clone()).map_err(|e| ParseError {
-                            message: format!("invalid digests: {}", e),
-                        })
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
-                let fd = params
-                    .get("fd")
-                    .ok_or_else(|| ParseError {
-                        message: "missing 'fd' field in file message".to_string(),
-                    })
-                    .and_then(|v| {
-                        serde_json::from_value(v.clone()).map_err(|e| ParseError {
-                            message: format!("invalid fd: {}", e),
-                        })
-                    })?;
-                Ok(StreamMessage::File {
-                    name,
-                    size,
-                    digests,
-                    fd,
-                })
-            }
-            "stream.end" => Ok(StreamMessage::End),
-            _ => Err(ParseError {
-                message: format!("unknown stream method: {}", method),
-            }),
-        }
-    }
-
-    /// Create a JSON-RPC notification from this message.
-    pub fn to_notification(&self) -> JsonRpcNotification {
-        JsonRpcNotification::new(self.method_name().to_string(), Some(self.to_params()))
-    }
-}
+/// Media type for zstd-compressed splitfdstream.
+pub const SPLITFDSTREAM_MEDIA_TYPE_ZSTD: &str = "application/vnd.containers.splitfdstream+zstd";
 
 /// Standard JSON-RPC error codes.
 pub mod error_codes {
@@ -248,31 +61,177 @@ pub mod error_codes {
     pub const IO_ERROR: i32 = -32003;
 }
 
-/// Parameters for layer.streamTarSplit method.
+/// Parameters for GetLayerSplitfdstream method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamTarSplitParams {
+pub struct GetLayerSplitfdstreamParams {
     /// Layer ID (typically sha256:...)
-    pub layer_id: String,
+    pub layer: String,
+    /// Whether to use zstd compression for the splitfdstream
+    #[serde(default)]
+    pub compressed: bool,
 }
 
-/// Parameters for layer.getFiles method.
+/// Result for GetLayerSplitfdstream method.
+///
+/// The actual splitfdstream and file content fds are passed separately
+/// via SCM_RIGHTS. The `fds` field in the JSON-RPC response indicates
+/// the count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetFilesParams {
-    /// Layer ID
-    pub layer_id: String,
-    /// File positions (indices from TOC)
-    pub positions: Vec<usize>,
+pub struct GetLayerSplitfdstreamResult {
+    /// Media type of the splitfdstream (fd\[0\])
+    #[serde(rename = "mediaType")]
+    pub media_type: String,
 }
 
-/// Parameters for layer.getMeta or image.getMeta method.
+impl GetLayerSplitfdstreamResult {
+    /// Create a new result for uncompressed splitfdstream.
+    pub fn new() -> Self {
+        Self {
+            media_type: SPLITFDSTREAM_MEDIA_TYPE.to_string(),
+        }
+    }
+
+    /// Create a new result for zstd-compressed splitfdstream.
+    pub fn new_zstd() -> Self {
+        Self {
+            media_type: SPLITFDSTREAM_MEDIA_TYPE_ZSTD.to_string(),
+        }
+    }
+}
+
+impl Default for GetLayerSplitfdstreamResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parameters for layer.getMeta method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetMetaParams {
     /// Layer or image ID
     #[serde(alias = "layer_id", alias = "image_id")]
     pub id: String,
-    /// Requested digest algorithms (optional)
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub digest_algorithms: Vec<String>,
+}
+
+// ============================================================================
+// Stream Protocol Messages
+// ============================================================================
+
+/// Parameters for `stream.start` notification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamStartParams {
+    /// Optional file descriptor for segments (not currently used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segments_fd: Option<u32>,
+}
+
+/// Parameters for `stream.seg` notification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamSegParams {
+    /// Base64-encoded segment data.
+    pub data: String,
+}
+
+/// Parameters for `stream.file` notification.
+///
+/// File descriptors are passed positionally (fd\[0\] contains the file content).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamFileParams {
+    /// File path in the archive.
+    pub name: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// Optional content digests (algorithm -> hex digest).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub digests: std::collections::HashMap<String, String>,
+}
+
+/// Stream message types for the tar-split streaming protocol.
+///
+/// File descriptors are passed positionally with the message, not inline in the JSON.
+/// The `fds` count field in the JSON-RPC message indicates how many fds accompany it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum StreamMessage {
+    /// Stream start notification.
+    Start {
+        /// Optional segments fd (not currently used).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        segments_fd: Option<u32>,
+    },
+    /// Segment data (base64-encoded tar header/padding bytes).
+    Seg {
+        /// Base64-encoded segment data.
+        data: String,
+    },
+    /// File entry with fd passed positionally.
+    File {
+        /// File path in the archive.
+        name: String,
+        /// File size in bytes.
+        size: u64,
+        /// Optional content digests.
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        digests: std::collections::HashMap<String, String>,
+    },
+    /// Stream end notification.
+    End,
+}
+
+impl StreamMessage {
+    /// Parse a stream message from a notification method and params.
+    ///
+    /// Returns an error if the method is unknown or params are invalid.
+    pub fn from_notification(
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> std::result::Result<Self, jsonrpc_fdpass::JsonRpcError<'static>> {
+        let params = params.unwrap_or(serde_json::Value::Null);
+        match method {
+            "stream.start" => {
+                let start: StreamStartParams = serde_json::from_value(params).map_err(|e| {
+                    jsonrpc_fdpass::JsonRpcError::owned(
+                        error_codes::INVALID_PARAMS,
+                        format!("Invalid stream.start params: {}", e),
+                        None::<()>,
+                    )
+                })?;
+                Ok(StreamMessage::Start {
+                    segments_fd: start.segments_fd,
+                })
+            }
+            "stream.seg" => {
+                let seg: StreamSegParams = serde_json::from_value(params).map_err(|e| {
+                    jsonrpc_fdpass::JsonRpcError::owned(
+                        error_codes::INVALID_PARAMS,
+                        format!("Invalid stream.seg params: {}", e),
+                        None::<()>,
+                    )
+                })?;
+                Ok(StreamMessage::Seg { data: seg.data })
+            }
+            "stream.file" => {
+                let file: StreamFileParams = serde_json::from_value(params).map_err(|e| {
+                    jsonrpc_fdpass::JsonRpcError::owned(
+                        error_codes::INVALID_PARAMS,
+                        format!("Invalid stream.file params: {}", e),
+                        None::<()>,
+                    )
+                })?;
+                Ok(StreamMessage::File {
+                    name: file.name,
+                    size: file.size,
+                    digests: file.digests,
+                })
+            }
+            "stream.end" => Ok(StreamMessage::End),
+            _ => Err(jsonrpc_fdpass::JsonRpcError::owned(
+                error_codes::METHOD_NOT_FOUND,
+                format!("Unknown stream method: {}", method),
+                None::<()>,
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -280,183 +239,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fd_placeholder_serialization() {
-        let placeholder = FdPlaceholder::new(0);
-        let json = serde_json::to_string(&placeholder).unwrap();
-        assert_eq!(json, r#"{"__jsonrpc_fd__":true,"index":0}"#);
+    fn test_splitfdstream_result_serialization() {
+        let result = GetLayerSplitfdstreamResult::new();
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains(SPLITFDSTREAM_MEDIA_TYPE));
 
-        let parsed: FdPlaceholder = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.index, placeholder.index);
-        assert_eq!(parsed.marker, placeholder.marker);
+        let result_zstd = GetLayerSplitfdstreamResult::new_zstd();
+        let json_zstd = serde_json::to_string(&result_zstd).unwrap();
+        assert!(json_zstd.contains(SPLITFDSTREAM_MEDIA_TYPE_ZSTD));
     }
 
     #[test]
-    fn test_stream_message_start() {
-        let msg = StreamMessage::Start { segments_fd: None };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"start"}"#);
-    }
+    fn test_params_deserialization() {
+        let json = r#"{"layer":"sha256:abc123","compressed":true}"#;
+        let params: GetLayerSplitfdstreamParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.layer, "sha256:abc123");
+        assert!(params.compressed);
 
-    #[test]
-    fn test_stream_message_file() {
-        let mut digests = HashMap::new();
-        digests.insert("sha256".to_string(), "abc123".to_string());
-
-        let msg = StreamMessage::File {
-            name: "usr/bin/bash".to_string(),
-            size: 1234567,
-            digests,
-            fd: FdPlaceholder::new(0),
-        };
-
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"file""#));
-        assert!(json.contains(r#""name":"usr/bin/bash""#));
-        assert!(json.contains(r#""size":1234567"#));
-        assert!(json.contains(r#""__jsonrpc_fd__":true"#));
-    }
-
-    #[test]
-    fn test_stream_message_seg() {
-        let msg = StreamMessage::Seg {
-            data: "dXN0YXIAMDA=".to_string(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"seg""#));
-        assert!(json.contains(r#""data":"dXN0YXIAMDA=""#));
-    }
-
-    #[test]
-    fn test_stream_message_end() {
-        let msg = StreamMessage::End;
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"end"}"#);
-    }
-
-    #[test]
-    fn test_stream_message_method_names() {
-        assert_eq!(
-            StreamMessage::Start { segments_fd: None }.method_name(),
-            "stream.start"
-        );
-        assert_eq!(
-            StreamMessage::Seg {
-                data: String::new()
-            }
-            .method_name(),
-            "stream.seg"
-        );
-        assert_eq!(
-            StreamMessage::File {
-                name: String::new(),
-                size: 0,
-                digests: HashMap::new(),
-                fd: FdPlaceholder::new(0),
-            }
-            .method_name(),
-            "stream.file"
-        );
-        assert_eq!(StreamMessage::End.method_name(), "stream.end");
-    }
-
-    #[test]
-    fn test_stream_message_to_params() {
-        let msg = StreamMessage::Seg {
-            data: "test".to_string(),
-        };
-        let params = msg.to_params();
-        assert_eq!(params.get("data").unwrap().as_str().unwrap(), "test");
-    }
-
-    #[test]
-    fn test_stream_message_from_notification() {
-        // Test start
-        let msg = StreamMessage::from_notification("stream.start", None).unwrap();
-        assert!(matches!(msg, StreamMessage::Start { segments_fd: None }));
-
-        // Test seg
-        let msg = StreamMessage::from_notification(
-            "stream.seg",
-            Some(serde_json::json!({"data": "abc"})),
-        )
-        .unwrap();
-        if let StreamMessage::Seg { data } = msg {
-            assert_eq!(data, "abc");
-        } else {
-            panic!("expected Seg");
-        }
-
-        // Test file
-        let msg = StreamMessage::from_notification(
-            "stream.file",
-            Some(serde_json::json!({
-                "name": "test.txt",
-                "size": 100,
-                "fd": {"__jsonrpc_fd__": true, "index": 0}
-            })),
-        )
-        .unwrap();
-        if let StreamMessage::File { name, size, fd, .. } = msg {
-            assert_eq!(name, "test.txt");
-            assert_eq!(size, 100);
-            assert_eq!(fd.index, 0);
-        } else {
-            panic!("expected File");
-        }
-
-        // Test end
-        let msg = StreamMessage::from_notification("stream.end", None).unwrap();
-        assert!(matches!(msg, StreamMessage::End));
-    }
-
-    #[test]
-    fn test_stream_message_from_notification_errors() {
-        // Unknown method
-        let err = StreamMessage::from_notification("unknown.method", None).unwrap_err();
-        assert!(err.message.contains("unknown stream method"));
-
-        // Missing data in seg
-        let err = StreamMessage::from_notification("stream.seg", None).unwrap_err();
-        assert!(err.message.contains("missing 'data' field"));
-
-        // Missing name in file
-        let err = StreamMessage::from_notification(
-            "stream.file",
-            Some(serde_json::json!({"size": 100, "fd": {"__jsonrpc_fd__": true, "index": 0}})),
-        )
-        .unwrap_err();
-        assert!(err.message.contains("missing 'name' field"));
-    }
-
-    #[test]
-    fn test_stream_message_roundtrip() {
-        let original = StreamMessage::File {
-            name: "test/path".to_string(),
-            size: 42,
-            digests: HashMap::new(),
-            fd: FdPlaceholder::new(1),
-        };
-
-        let method = original.method_name();
-        let params = original.to_params();
-        let parsed = StreamMessage::from_notification(method, Some(params)).unwrap();
-
-        if let StreamMessage::File { name, size, fd, .. } = parsed {
-            assert_eq!(name, "test/path");
-            assert_eq!(size, 42);
-            assert_eq!(fd.index, 1);
-        } else {
-            panic!("expected File");
-        }
-    }
-
-    #[test]
-    fn test_to_notification() {
-        let msg = StreamMessage::Seg {
-            data: "test".to_string(),
-        };
-        let notif = msg.to_notification();
-        assert_eq!(notif.method, "stream.seg");
-        assert!(notif.params.is_some());
+        // Test default for compressed
+        let json_no_compress = r#"{"layer":"sha256:abc123"}"#;
+        let params2: GetLayerSplitfdstreamParams = serde_json::from_str(json_no_compress).unwrap();
+        assert!(!params2.compressed);
     }
 }

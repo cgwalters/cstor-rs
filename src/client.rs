@@ -27,13 +27,12 @@ use std::io::Read;
 use std::os::unix::io::OwnedFd;
 
 use base64::prelude::*;
-use ndjson_rpc_fdpass::transport::{Receiver, UnixSocketTransport};
-use ndjson_rpc_fdpass::{Error as RpcError, JsonRpcMessage};
+use jsonrpc_fdpass::transport::{Receiver, UnixSocketTransport};
+use jsonrpc_fdpass::{Error as RpcError, JsonRpcMessage};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use crate::error::{Result, StorageError};
-use crate::protocol::StreamMessage;
 
 /// Client for receiving tar-split streams with file descriptors.
 pub struct TarSplitClient {
@@ -103,50 +102,55 @@ impl TarSplitClient {
             }
         };
 
-        // Parse the method and params using StreamMessage helper
-        let stream_msg =
-            StreamMessage::from_notification(&notification.method, notification.params.clone())
-                .map_err(|e| StorageError::TarSplitError(e.message))?;
-
         let mut fds = msg_with_fds.file_descriptors;
+        let params = notification
+            .params
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
 
-        match stream_msg {
-            StreamMessage::Start { .. } => {
+        match notification.method.as_str() {
+            "stream.start" => {
                 // Start message - continue to next item
                 Box::pin(self.next_item()).await
             }
-            StreamMessage::Seg { data } => {
+            "stream.seg" => {
                 // Decode base64 segment data
-                let bytes = BASE64_STANDARD.decode(&data).map_err(|e| {
+                let data = params.get("data").and_then(|v| v.as_str()).ok_or_else(|| {
+                    StorageError::TarSplitError("Segment missing 'data' field".to_string())
+                })?;
+                let bytes = BASE64_STANDARD.decode(data).map_err(|e| {
                     StorageError::TarSplitError(format!("Failed to decode segment: {}", e))
                 })?;
                 Ok(Some(ReceivedItem::Segment(bytes)))
             }
-            StreamMessage::File {
-                name,
-                size,
-                fd: fd_placeholder,
-                ..
-            } => {
-                // Get the fd from the received fds
+            "stream.file" => {
+                // Parse file metadata from params
+                let name = params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        StorageError::TarSplitError("File missing 'name' field".to_string())
+                    })?
+                    .to_string();
+                let size = params.get("size").and_then(|v| v.as_u64()).ok_or_else(|| {
+                    StorageError::TarSplitError("File missing 'size' field".to_string())
+                })?;
+
+                // File descriptors are passed positionally - fd[0] is the file content
                 if fds.is_empty() {
                     return Err(StorageError::TarSplitError(
                         "File message received without fd".to_string(),
                     ));
                 }
-                let fd_index = fd_placeholder.index;
-                if fd_index >= fds.len() {
-                    return Err(StorageError::TarSplitError(format!(
-                        "Invalid fd index {} (have {} fds)",
-                        fd_index,
-                        fds.len()
-                    )));
-                }
-                // Take ownership of the fd at the specified index
-                let fd = fds.swap_remove(fd_index);
+                // Take ownership of the first fd (positional)
+                let fd = fds.remove(0);
                 Ok(Some(ReceivedItem::File { name, size, fd }))
             }
-            StreamMessage::End => Ok(Some(ReceivedItem::End)),
+            "stream.end" => Ok(Some(ReceivedItem::End)),
+            other => Err(StorageError::TarSplitError(format!(
+                "Unknown notification method: {}",
+                other
+            ))),
         }
     }
 
@@ -250,9 +254,8 @@ impl TarSplitClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::FdPlaceholder;
-    use ndjson_rpc_fdpass::transport::UnixSocketTransport;
-    use ndjson_rpc_fdpass::{JsonRpcNotification, MessageWithFds};
+    use jsonrpc_fdpass::transport::UnixSocketTransport;
+    use jsonrpc_fdpass::{JsonRpcNotification, MessageWithFds};
 
     /// Helper to create a notification MessageWithFds for a StreamMessage
     fn make_notification(
@@ -261,10 +264,7 @@ mod tests {
         fds: Vec<OwnedFd>,
     ) -> MessageWithFds {
         let notification = JsonRpcNotification::new(method.to_string(), params);
-        MessageWithFds::new(
-            ndjson_rpc_fdpass::JsonRpcMessage::Notification(notification),
-            fds,
-        )
+        MessageWithFds::new(JsonRpcMessage::Notification(notification), fds)
     }
 
     #[tokio::test]
@@ -310,11 +310,10 @@ mod tests {
         let file_size = file.metadata().unwrap().len();
         let owned_fd: OwnedFd = file.into();
 
-        // Send a file message with fd
+        // Send a file message with fd (fds are passed positionally, not in JSON)
         let file_params = serde_json::json!({
             "name": "/etc/hosts",
-            "size": file_size,
-            "fd": FdPlaceholder::new(0)
+            "size": file_size
         });
         let msg = make_notification("stream.file", Some(file_params), vec![owned_fd]);
         sender.send(msg).await.unwrap();

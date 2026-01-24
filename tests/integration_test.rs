@@ -1222,6 +1222,156 @@ fn test_toc_matches_tar() -> Result<()> {
     Ok(())
 }
 
+/// Test that splitfdstream round-trip produces correct output.
+///
+/// This test:
+/// 1. Discovers storage and finds an image/layer
+/// 2. Exports the layer via the OLD method (direct tar reconstruction using TarSplitFdStream)
+/// 3. Exports the layer via the NEW method (layer_to_splitfdstream -> reconstruct_tar)
+/// 4. Compares the two outputs to verify they're byte-for-byte identical
+///
+/// This validates that the splitfdstream format correctly encodes and decodes
+/// tar streams without data loss.
+#[test]
+#[ignore] // Requires podman and test image
+fn test_splitfdstream_roundtrip() -> Result<()> {
+    use cstor_rs::splitfdstream::reconstruct_tar_seekable;
+    use cstor_rs::{
+        DEFAULT_INLINE_THRESHOLD, Storage, TarSplitFdStream, TarSplitItem, layer_to_splitfdstream,
+    };
+    use std::io::{Read, Write};
+
+    ensure_test_image().context("Failed to ensure test image")?;
+
+    let image_id = get_image_id(TEST_IMAGE).context("Failed to get image ID")?;
+    println!(
+        "Testing splitfdstream roundtrip for image: {} ({})",
+        TEST_IMAGE, image_id
+    );
+
+    // 1. Discover storage
+    let storage = Storage::discover().context("Failed to discover storage")?;
+
+    // 2. Get a layer from the test image
+    let image = storage
+        .get_image(&image_id)
+        .context("Failed to get image")?;
+    let layers = storage
+        .get_image_layers(&image)
+        .context("Failed to get layers")?;
+    let layer = layers
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Image has no layers"))?;
+
+    println!("Testing layer: {}", layer.id);
+
+    // 3. Export via OLD method: directly iterate TarSplitFdStream and write tar
+    let mut old_output = Vec::new();
+    {
+        let mut stream =
+            TarSplitFdStream::new(&storage, layer).context("Failed to create TarSplitFdStream")?;
+
+        while let Some(item) = stream.next().context("Failed to read tar-split item")? {
+            match item {
+                TarSplitItem::Segment(bytes) => {
+                    old_output
+                        .write_all(&bytes)
+                        .context("Failed to write segment")?;
+                }
+                TarSplitItem::FileContent { fd, size, name: _ } => {
+                    // Read file content from fd
+                    let mut file = std::fs::File::from(fd);
+                    let mut buf = vec![0u8; size as usize];
+                    file.read_exact(&mut buf)
+                        .context("Failed to read file content")?;
+                    old_output
+                        .write_all(&buf)
+                        .context("Failed to write file content")?;
+                }
+            }
+        }
+    }
+
+    println!("Old method produced {} bytes", old_output.len());
+
+    // 4. Export via NEW method: layer_to_splitfdstream -> reconstruct_tar
+    let splitfd = layer_to_splitfdstream(&storage, layer, DEFAULT_INLINE_THRESHOLD)
+        .context("Failed to create splitfdstream")?;
+
+    println!(
+        "Splitfdstream: {} bytes stream, {} external fds",
+        splitfd.stream.len(),
+        splitfd.files.len()
+    );
+
+    let mut new_output = Vec::new();
+    reconstruct_tar_seekable(
+        std::io::Cursor::new(&splitfd.stream),
+        &splitfd.files,
+        &mut new_output,
+    )
+    .context("Failed to reconstruct tar from splitfdstream")?;
+
+    println!("New method produced {} bytes", new_output.len());
+
+    // 5. Compare outputs
+    if old_output.len() != new_output.len() {
+        anyhow::bail!(
+            "Output size mismatch: old={} bytes, new={} bytes",
+            old_output.len(),
+            new_output.len()
+        );
+    }
+
+    // Find first difference for debugging
+    for (i, (old_byte, new_byte)) in old_output.iter().zip(new_output.iter()).enumerate() {
+        if old_byte != new_byte {
+            anyhow::bail!(
+                "First difference at byte {}: old=0x{:02x}, new=0x{:02x}",
+                i,
+                old_byte,
+                new_byte
+            );
+        }
+    }
+
+    // Final hash comparison
+    let old_hash = format!("{:x}", Sha256::digest(&old_output));
+    let new_hash = format!("{:x}", Sha256::digest(&new_output));
+
+    println!("Old hash: {}", old_hash);
+    println!("New hash: {}", new_hash);
+
+    assert_eq!(old_hash, new_hash, "Tar stream hashes should be identical");
+
+    // Verify the tar is valid by listing contents
+    let temp_dir = TempDir::new()?;
+    let tar_path = temp_dir.path().join("test.tar");
+    fs::write(&tar_path, &new_output).context("Failed to write test tar")?;
+
+    let tar_list = Command::new("tar")
+        .args(["-tf", tar_path.to_str().unwrap()])
+        .output()
+        .context("Failed to list tar contents")?;
+
+    if tar_list.status.success() {
+        let entry_count = String::from_utf8_lossy(&tar_list.stdout).lines().count();
+        println!("Tar contains {} entries", entry_count);
+        assert!(entry_count > 0, "Tar should have entries");
+    } else {
+        anyhow::bail!(
+            "Generated tar is invalid: {}",
+            String::from_utf8_lossy(&tar_list.stderr)
+        );
+    }
+
+    println!("\n✓ Splitfdstream roundtrip test passed");
+    println!("  - Old and new methods produce identical output");
+    println!("  - {} bytes, SHA256: {}", old_output.len(), old_hash);
+
+    Ok(())
+}
+
 /// Test that file descriptors received via IPC can be used for reflinks.
 ///
 /// This test:

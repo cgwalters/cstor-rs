@@ -31,10 +31,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use tracing::debug;
-
 use crate::error::{Result, StorageError};
-use crate::generic_tree::{FileSystem, Inode, TreeError};
+use crate::generic_tree::TreeError;
 use crate::layer::Layer;
 use crate::storage::Storage;
 use crate::tar_split::{TarHeader, TarSplitFdStream, TarSplitItem};
@@ -416,21 +414,44 @@ impl Toc {
     /// # Ok::<(), cstor_rs::StorageError>(())
     /// ```
     pub fn merge(&mut self, upper: Toc) -> Result<()> {
-        // Build a tree from current entries for secure path operations.
-        // The tree validates paths (rejecting . and .. components) and
-        // provides efficient directory clearing for opaque whiteouts.
-        // All entries are stored as leaves - the tree structure is for
-        // path handling, not representing the filesystem hierarchy.
-        let mut tree: FileSystem<TocEntry> = FileSystem::new();
+        // Use a HashMap to store entries by path.
+        // This avoids the tree's limitation where directory entries conflict
+        // with the tree's internal directory nodes.
+        let mut entries_map: HashMap<PathBuf, TocEntry> = HashMap::new();
 
-        // Insert existing entries into tree.
-        // InvalidFilename errors (security) are propagated, structural errors are logged.
-        for entry in self.entries.drain(..) {
-            if let Err(e) = tree.insert(entry.name.as_os_str(), Inode::new_leaf(entry.clone())) {
-                match e {
-                    TreeError::InvalidFilename(_) => return Err(e.into()),
-                    _ => debug!("skipping entry {:?}: {e}", entry.name),
+        // Validate a path for security (reject . and .. components)
+        let validate_path = |path: &Path| -> Result<()> {
+            for component in path.components() {
+                match component {
+                    std::path::Component::CurDir => {
+                        return Err(StorageError::from(TreeError::InvalidFilename(
+                            path.as_os_str().into(),
+                        )));
+                    }
+                    std::path::Component::ParentDir => {
+                        return Err(StorageError::from(TreeError::InvalidFilename(
+                            path.as_os_str().into(),
+                        )));
+                    }
+                    _ => {}
                 }
+            }
+            Ok(())
+        };
+
+        // Normalize path by stripping leading /
+        let normalize_path = |path: &Path| -> PathBuf {
+            let s = path.to_string_lossy();
+            let stripped = s.trim_start_matches('/');
+            PathBuf::from(stripped)
+        };
+
+        // Insert existing entries into map
+        for entry in self.entries.drain(..) {
+            validate_path(&entry.name)?;
+            let normalized = normalize_path(&entry.name);
+            if !normalized.as_os_str().is_empty() {
+                entries_map.insert(normalized, entry);
             }
         }
 
@@ -441,67 +462,52 @@ impl Toc {
                 // The directory itself is NOT removed - only its contents from lower layers.
                 if opaque_dir.as_os_str().is_empty() {
                     // Root opaque marker clears everything
-                    tree = FileSystem::new();
+                    entries_map.clear();
                 } else {
-                    // Clear contents under this directory using tree operation.
-                    // First, remove all entries that start with this prefix.
-                    // We need to collect and remove since clear_directory only
-                    // clears directory inode contents, but we store entries as leaves.
-                    let paths_to_remove: Vec<String> = tree
-                        .iter_leaves()
-                        .filter(|(path, _)| {
-                            Path::new(path).starts_with(opaque_dir) && Path::new(path) != opaque_dir
-                        })
-                        .map(|(path, _)| path.clone())
+                    // Remove all entries that start with this prefix (but not the dir itself)
+                    let paths_to_remove: Vec<PathBuf> = entries_map
+                        .keys()
+                        .filter(|path| path.starts_with(opaque_dir) && path.as_path() != opaque_dir)
+                        .cloned()
                         .collect();
                     for path in paths_to_remove {
-                        if let Err(e) = tree.remove(OsStr::new(&path)) {
-                            debug!("whiteout remove of {path:?} failed: {e}");
-                        }
+                        entries_map.remove(&path);
                     }
                 }
                 // Don't add the opaque marker itself to the TOC
             } else if let Some(target) = entry.whiteout_target() {
                 // Regular whiteout: remove the target entry and anything under it.
-                // First remove the target itself.
-                if let Err(e) = tree.remove(target.as_os_str()) {
-                    debug!("whiteout remove of {target:?} failed: {e}");
-                }
-                // Then remove all entries under the target (if it was a directory).
-                let paths_to_remove: Vec<String> = tree
-                    .iter_leaves()
-                    .filter(|(path, _)| Path::new(path).starts_with(&target))
-                    .map(|(path, _)| path.clone())
+                entries_map.remove(&target);
+                // Also remove all entries under the target (if it was a directory)
+                let paths_to_remove: Vec<PathBuf> = entries_map
+                    .keys()
+                    .filter(|path| path.starts_with(&target))
+                    .cloned()
                     .collect();
                 for path in paths_to_remove {
-                    if let Err(e) = tree.remove(OsStr::new(&path)) {
-                        debug!("whiteout remove of {path:?} failed: {e}");
-                    }
+                    entries_map.remove(&path);
                 }
                 // Don't add the whiteout marker itself to the TOC
             } else {
                 // Regular entry: add or replace.
-                // InvalidFilename errors (security) are propagated, structural errors are logged.
-                if let Err(e) = tree.insert(entry.name.as_os_str(), Inode::new_leaf(entry.clone()))
-                {
-                    match e {
-                        TreeError::InvalidFilename(_) => return Err(e.into()),
-                        _ => debug!("skipping entry {:?}: {e}", entry.name),
-                    }
+                validate_path(&entry.name)?;
+                let normalized = normalize_path(&entry.name);
+                if !normalized.as_os_str().is_empty() {
+                    entries_map.insert(normalized, entry);
                 }
             }
         }
 
-        // Convert tree back to entries vector (already sorted by tree iteration order)
-        self.entries = tree
-            .into_leaves()
-            .map(|(path, entry)| {
-                // Update the name to the canonical path from the tree
-                let mut e = entry;
-                e.name = PathBuf::from(path);
-                e
+        // Convert map back to entries vector, sorted by path
+        let mut entries: Vec<TocEntry> = entries_map
+            .into_iter()
+            .map(|(path, mut entry)| {
+                entry.name = path;
+                entry
             })
             .collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        self.entries = entries;
 
         Ok(())
     }
@@ -693,9 +699,37 @@ impl Toc {
     ) -> Result<(Self, HashMap<PathBuf, String>)> {
         let layer_ids = image.layers()?;
 
-        // Use a tree that stores (TocEntry, layer_id) pairs.
-        // This ensures path validation and keeps TOC and layer map in sync.
-        let mut tree: FileSystem<(TocEntry, String)> = FileSystem::new();
+        // Use a HashMap to store (TocEntry, layer_id) pairs.
+        // This avoids the tree's limitation where directory entries conflict
+        // with the tree's internal directory nodes.
+        let mut entries_map: HashMap<PathBuf, (TocEntry, String)> = HashMap::new();
+
+        // Validate a path for security (reject . and .. components)
+        let validate_path = |path: &Path| -> Result<()> {
+            for component in path.components() {
+                match component {
+                    std::path::Component::CurDir => {
+                        return Err(StorageError::from(TreeError::InvalidFilename(
+                            path.as_os_str().into(),
+                        )));
+                    }
+                    std::path::Component::ParentDir => {
+                        return Err(StorageError::from(TreeError::InvalidFilename(
+                            path.as_os_str().into(),
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        };
+
+        // Normalize path by stripping leading /
+        let normalize_path = |path: &Path| -> PathBuf {
+            let s = path.to_string_lossy();
+            let stripped = s.trim_start_matches('/');
+            PathBuf::from(stripped)
+        };
 
         // Process layers in order (base to top)
         for layer_id in &layer_ids {
@@ -707,63 +741,54 @@ impl Toc {
                 if let Some(opaque_dir) = entry.opaque_dir() {
                     // Opaque whiteout: clear all entries UNDER this directory.
                     if opaque_dir.as_os_str().is_empty() {
-                        tree = FileSystem::new();
+                        entries_map.clear();
                     } else {
-                        // Remove all entries that start with this prefix
-                        let paths_to_remove: Vec<String> = tree
-                            .iter_leaves()
-                            .filter(|(path, _)| {
-                                Path::new(path).starts_with(opaque_dir)
-                                    && Path::new(path) != opaque_dir
+                        // Remove all entries that start with this prefix (but not the dir itself)
+                        let paths_to_remove: Vec<PathBuf> = entries_map
+                            .keys()
+                            .filter(|path| {
+                                path.starts_with(opaque_dir) && path.as_path() != opaque_dir
                             })
-                            .map(|(path, _)| path.clone())
+                            .cloned()
                             .collect();
                         for path in paths_to_remove {
-                            if let Err(e) = tree.remove(OsStr::new(&path)) {
-                                debug!("whiteout remove of {path:?} failed: {e}");
-                            }
+                            entries_map.remove(&path);
                         }
                     }
                     // Don't add opaque marker
                 } else if let Some(target) = entry.whiteout_target() {
                     // Regular whiteout: remove the target and anything under it.
-                    if let Err(e) = tree.remove(target.as_os_str()) {
-                        debug!("whiteout remove of {target:?} failed: {e}");
-                    }
-                    let paths_to_remove: Vec<String> = tree
-                        .iter_leaves()
-                        .filter(|(path, _)| Path::new(path).starts_with(&target))
-                        .map(|(path, _)| path.clone())
+                    entries_map.remove(&target);
+                    let paths_to_remove: Vec<PathBuf> = entries_map
+                        .keys()
+                        .filter(|path| path.starts_with(&target))
+                        .cloned()
                         .collect();
                     for path in paths_to_remove {
-                        if let Err(e) = tree.remove(OsStr::new(&path)) {
-                            debug!("whiteout remove of {path:?} failed: {e}");
-                        }
+                        entries_map.remove(&path);
                     }
                     // Don't add whiteout marker
                 } else {
                     // Regular entry: add or replace with layer ID.
-                    // InvalidFilename errors (security) are propagated, structural errors are logged.
-                    let data = (entry.clone(), layer_id.clone());
-                    if let Err(e) = tree.insert(entry.name.as_os_str(), Inode::new_leaf(data)) {
-                        match e {
-                            TreeError::InvalidFilename(_) => return Err(e.into()),
-                            _ => debug!("skipping entry {:?}: {e}", entry.name),
-                        }
+                    validate_path(&entry.name)?;
+                    let normalized = normalize_path(&entry.name);
+                    if !normalized.as_os_str().is_empty() {
+                        entries_map.insert(normalized, (entry, layer_id.clone()));
                     }
                 }
             }
         }
 
-        // Convert tree to TOC entries and layer map
+        // Convert map to TOC entries and layer map, sorted by path
         let mut entries = Vec::new();
         let mut layer_map = HashMap::new();
 
-        for (path, (entry, layer_id)) in tree.into_leaves() {
-            let mut e = entry;
-            let path = PathBuf::from(path);
-            e.name = path.clone();
-            entries.push(e);
+        let mut sorted_entries: Vec<_> = entries_map.into_iter().collect();
+        sorted_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (path, (mut entry, layer_id)) in sorted_entries {
+            entry.name = path.clone();
+            entries.push(entry);
             layer_map.insert(path, layer_id);
         }
 

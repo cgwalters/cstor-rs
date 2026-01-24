@@ -10,6 +10,8 @@ This library provides direct read access to container images stored in container
 
 The core innovation is using tar-split metadata to reconstruct tar archives without walking filesystem directories, streaming tar headers from metadata while passing file descriptors directly for regular files. This enables zero-copy operations on copy-on-write filesystems.
 
+The library includes the **splitfdstream** format - a binary streaming format that separates inline metadata from external file content, enabling efficient IPC with file descriptor passing.
+
 ### What This Reimplements
 
 The library reimplements read-only access to:
@@ -73,6 +75,25 @@ flowchart TB
 {"jsonrpc":"2.0","method":"layer.end","params":{"files_sent":42}}
 ```
 
+## Splitfdstream Format
+
+The library implements a binary streaming format called **splitfdstream** for efficiently serializing tar archives with external file references. This format enables:
+
+- **Zero-copy file transfer**: Large files are passed as file descriptors rather than serialized inline
+- **Efficient IPC**: Works with Unix socket fd-passing via `SCM_RIGHTS`
+- **Flexible thresholds**: Small files (<4KB by default) are inlined, large files become fd references
+
+### Wire Format
+
+```
+| Prefix (i64 LE) | Meaning |
+|-----------------|---------|
+| < 0             | Inline: next abs(prefix) bytes are literal data |
+| >= 0            | External: content from fd[prefix + 1] |
+```
+
+The `splitfdstream` module provides reader/writer implementations and tar extraction utilities with full overlay whiteout support.
+
 ## Features
 
 **Core Capabilities:**
@@ -81,14 +102,17 @@ flowchart TB
 - **Capability-based security**: All file operations use cap-std for path traversal protection
 - **Read-only by design**: No modifications to containers-storage
 - **OCI compatibility**: Full oci-spec and ocidir integration for standard image formats
-- **TOC generation**: eStargz-compatible Table of Contents for layer indexing
+- **TOC generation**: eStargz-compatible Table of Contents for layer indexing with whiteout support
+- **splitfdstream format**: Binary format for serializing tar archives with external file references
 - **Reflink extraction**: Efficient copy-on-write extraction on btrfs/XFS filesystems
+- **Overlay whiteout handling**: Full support for `.wh.*` and opaque directory markers
 - **Direct file access**: Layer::open_file_std() API for reading individual files
 
 **Implementation Highlights:**
 - Rust implementation of tar-split format parser
 - Layer chain resolution with overlay semantics (handling parent layers)
-- Whiteout and opaque whiteout handling
+- Whiteout and opaque whiteout handling (`.wh.*` files and `.wh..wh..opq` markers)
+- IPC server/client with JSON-RPC 2.0 over Unix sockets
 - SQLite database access for storage metadata
 - Link identifier resolution through symlink directory
 - CRC64 verification for file integrity
@@ -175,14 +199,19 @@ cargo doc --open
 
 Key modules:
 - `storage`: Storage discovery and root directory access
-- `image`: Image manifest and configuration parsing
+- `image`: Image manifest and configuration parsing  
 - `layer`: Layer hierarchy, chain resolution, and file access
 - `tar_split`: tar-split format parsing and TarSplitFdStream
+- `splitfdstream`: Binary format for tar streams with external fd references
 - `tar_writer`: TAR header writing utilities
-- `toc`: Table of Contents generation (eStargz-compatible)
+- `toc`: Table of Contents generation with whiteout support
+- `server`: JSON-RPC server for streaming layers with fd passing
+- `client`: JSON-RPC client for receiving layer streams
+- `protocol`: Wire format definitions for IPC
+- `proxy_v2`: Client for skopeo v2 protocol with JSON-RPC fd passing
+- `generic_tree`: Secure path-validated filesystem tree
 - `config`: storage.conf parsing
 - `error`: Error types and handling
-- `proxy_v2`: Client for skopeo v2 protocol with JSON-RPC FD passing
 
 ## Testing
 
@@ -235,9 +264,22 @@ This tests:
 - SQLite database queries for layer/image metadata
 - tar-split parsing and bit-for-bit tar reconstruction
 - Layer chain resolution with overlay semantics
-- Whiteout and opaque whiteout handling
+- Whiteout and opaque whiteout handling (`.wh.*` and `.wh..wh..opq`)
 - Reflink extraction on CoW filesystems
 - CLI tools for inspection, export, and extraction
+- CLI accepts image names in addition to IDs
+
+**Splitfdstream Format:**
+- Binary streaming format for tar with external fd references
+- Reader/writer implementations with configurable inline thresholds
+- Tar extraction with full overlay whiteout semantics
+- Integration with tar crate for entry type handling
+
+**IPC Infrastructure:**
+- JSON-RPC 2.0 server for streaming layers with fd passing
+- Async client for receiving and reconstructing layer streams
+- `GetLayerSplitfdstream` method returning memfd + content fds
+- Integration tests proving fd-passing works for reflink use case
 
 **Proxy v2 Infrastructure:**
 - **jsonrpc-fdpass-go**: Go library for JSON-RPC 2.0 with SCM_RIGHTS FD passing
@@ -247,13 +289,14 @@ This tests:
 
 ### In Progress
 
-- **GetLayerTarSplit**: The key method for streaming tar-split data with FDs
 - **End-to-end testing**: Extract real container layers using skopeo proxy
+- **Performance optimization**: Buffer sizes, concurrent access patterns
 
 ### Planned
 
 - Update containers-image-proxy-rs to support JSON-RPC protocol
 - Performance benchmarks on btrfs vs ext4
+- Zstd compression support for splitfdstream
 
 ## Contributing
 

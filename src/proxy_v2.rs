@@ -49,15 +49,14 @@
 use std::os::unix::io::OwnedFd;
 
 use base64::prelude::*;
-use ndjson_rpc_fdpass::transport::{Receiver, Sender, UnixSocketTransport};
-use ndjson_rpc_fdpass::{
+use jsonrpc_fdpass::transport::{Receiver, Sender, UnixSocketTransport};
+use jsonrpc_fdpass::{
     Error as RpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, MessageWithFds,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
 
 use crate::error::{Result, StorageError};
-use crate::protocol::FdPlaceholder;
 
 // ============================================================================
 // Request/Response Message Types
@@ -137,6 +136,10 @@ pub struct LayerSegmentParams {
 }
 
 /// Parameters for the `layer.file` notification.
+///
+/// Note: The file descriptor for the file content is passed positionally
+/// in the `MessageWithFds.file_descriptors` vector, not as a field in
+/// this struct.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerFileParams {
     /// File name/path within the tar archive.
@@ -155,8 +158,6 @@ pub struct LayerFileParams {
     /// Symlink/hardlink target (empty for regular files).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_name: Option<String>,
-    /// File descriptor placeholder for the file content.
-    pub fd: FdPlaceholder,
 }
 
 /// Parameters for the `layer.end` notification.
@@ -600,24 +601,15 @@ impl LayerStream<'_> {
                 let file: LayerFileParams =
                     serde_json::from_value(params).map_err(StorageError::JsonParse)?;
 
-                // Extract the file descriptor
+                // Extract the file descriptor (passed positionally as first fd)
                 if fds.is_empty() {
                     return Err(StorageError::TarSplitError(
                         "layer.file notification received without file descriptor".to_string(),
                     ));
                 }
 
-                let fd_index = file.fd.index;
-                if fd_index >= fds.len() {
-                    return Err(StorageError::TarSplitError(format!(
-                        "Invalid fd index {} (have {} fds)",
-                        fd_index,
-                        fds.len()
-                    )));
-                }
-
-                // Take ownership of the fd
-                let fd = fds.swap_remove(fd_index);
+                // Take ownership of the first fd (file descriptors are passed positionally)
+                let fd = fds.remove(0);
 
                 Ok(Some(LayerItem::File {
                     name: file.name,
@@ -651,8 +643,8 @@ impl LayerStream<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndjson_rpc_fdpass::JsonRpcResponse;
-    use ndjson_rpc_fdpass::transport::UnixSocketTransport;
+    use jsonrpc_fdpass::JsonRpcResponse;
+    use jsonrpc_fdpass::transport::UnixSocketTransport;
 
     /// Helper to create a notification MessageWithFds
     fn make_notification(
@@ -791,13 +783,13 @@ mod tests {
             // Send layer.file notification with fd
             let file = std::fs::File::open("/etc/hosts").unwrap();
             let fd: OwnedFd = file.into();
+            // Note: fd is passed positionally via file_descriptors, not in JSON
             let file_params = serde_json::json!({
                 "name": "etc/hosts",
                 "size": 100,
                 "mode": 0o644,
                 "uid": 0,
-                "gid": 0,
-                "fd": { "__jsonrpc_fd__": true, "index": 0 }
+                "gid": 0
             });
             sender
                 .send(make_notification("layer.file", Some(file_params), vec![fd]))

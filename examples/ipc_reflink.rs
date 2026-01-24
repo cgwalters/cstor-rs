@@ -12,18 +12,16 @@
 //! Example:
 //!   cargo run --example ipc_reflink busybox ~/tmp/extracted
 
-use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use base64::prelude::*;
 use cstor_rs::client::{ReceivedItem, TarSplitClient};
-use cstor_rs::protocol::{FdPlaceholder, StreamMessage};
 use cstor_rs::tar_split::{TarSplitFdStream, TarSplitItem};
 use cstor_rs::{Image, Layer, Storage};
-use ndjson_rpc_fdpass::transport::UnixSocketTransport;
-use ndjson_rpc_fdpass::{JsonRpcMessage, JsonRpcNotification, MessageWithFds};
+use jsonrpc_fdpass::transport::UnixSocketTransport;
+use jsonrpc_fdpass::{JsonRpcMessage, JsonRpcNotification, MessageWithFds};
 use rustix::fs::ioctl_ficlone;
 use tokio::net::UnixStream;
 
@@ -129,11 +127,8 @@ async fn extract_layer_via_ipc(
         let (mut sender, _receiver) = transport.split();
 
         // Send start message
-        let start_msg = StreamMessage::Start { segments_fd: None };
-        let notification = JsonRpcNotification::new(
-            "stream.start".to_string(),
-            Some(serde_json::to_value(&start_msg).unwrap()),
-        );
+        let notification =
+            JsonRpcNotification::new("stream.start".to_string(), Some(serde_json::json!({})));
         sender
             .send(MessageWithFds::new(
                 JsonRpcMessage::Notification(notification),
@@ -147,10 +142,9 @@ async fn extract_layer_via_ipc(
             match item {
                 TarSplitItem::Segment(bytes) => {
                     let data = BASE64_STANDARD.encode(&bytes);
-                    let msg = StreamMessage::Seg { data };
                     let notification = JsonRpcNotification::new(
                         "stream.seg".to_string(),
-                        Some(serde_json::to_value(&msg).unwrap()),
+                        Some(serde_json::json!({ "data": data })),
                     );
                     sender
                         .send(MessageWithFds::new(
@@ -161,15 +155,13 @@ async fn extract_layer_via_ipc(
                         .map_err(|e| anyhow::anyhow!("Failed to send seg: {}", e))?;
                 }
                 TarSplitItem::FileContent { fd, size, name } => {
-                    let msg = StreamMessage::File {
-                        name,
-                        size,
-                        digests: HashMap::new(),
-                        fd: FdPlaceholder::new(0),
-                    };
+                    // File descriptors are passed positionally via SCM_RIGHTS
                     let notification = JsonRpcNotification::new(
                         "stream.file".to_string(),
-                        Some(serde_json::to_value(&msg).unwrap()),
+                        Some(serde_json::json!({
+                            "name": name,
+                            "size": size,
+                        })),
                     );
                     sender
                         .send(MessageWithFds::new(
@@ -183,11 +175,8 @@ async fn extract_layer_via_ipc(
         }
 
         // Send end message
-        let end_msg = StreamMessage::End;
-        let notification = JsonRpcNotification::new(
-            "stream.end".to_string(),
-            Some(serde_json::to_value(&end_msg).unwrap()),
-        );
+        let notification =
+            JsonRpcNotification::new("stream.end".to_string(), Some(serde_json::json!({})));
         sender
             .send(MessageWithFds::new(
                 JsonRpcMessage::Notification(notification),

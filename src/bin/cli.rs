@@ -133,6 +133,14 @@ enum Commands {
         /// Fall back to copying if reflinks are not supported
         #[arg(long)]
         force_copy: bool,
+
+        /// Use splitfdstream path for extraction (experimental)
+        ///
+        /// Instead of using the TOC-based approach, this uses splitfdstream
+        /// to get file descriptors for layer content. The splitfdstream
+        /// encodes tar metadata inline and references file content via fds.
+        #[arg(long)]
+        use_splitfdstream: bool,
     },
 
     /// Output Table of Contents (TOC) for an image as JSON
@@ -239,7 +247,8 @@ fn main() -> Result<()> {
             image_id,
             output,
             force_copy,
-        } => reflink_to_dir(&storage, &image_id, output, force_copy)?,
+            use_splitfdstream,
+        } => reflink_to_dir(&storage, &image_id, output, force_copy, use_splitfdstream)?,
         Commands::Toc { image_id, pretty } => output_toc(&storage, &image_id, pretty)?,
         Commands::ExportLayerIpc { layer_id, output } => {
             export_layer_ipc(&storage, &layer_id, output)?
@@ -551,10 +560,8 @@ fn reflink_to_dir(
     image_id: &str,
     dest: PathBuf,
     force_copy: bool,
+    use_splitfdstream: bool,
 ) -> Result<()> {
-    use cstor_rs::Toc;
-    use std::collections::HashMap;
-
     let image = open_image_by_id_or_name(storage, image_id)?;
 
     // Require parent directory to exist, but destination must not exist
@@ -571,10 +578,28 @@ fn reflink_to_dir(
     let dest_dir = Dir::open_ambient_dir(&dest, ambient_authority())
         .context("Failed to open destination directory")?;
 
+    if use_splitfdstream {
+        reflink_to_dir_splitfdstream(storage, &image, &dest_dir, &dest, force_copy)
+    } else {
+        reflink_to_dir_toc(storage, &image, &dest_dir, &dest, force_copy)
+    }
+}
+
+/// Extract image using TOC-based approach (original implementation).
+fn reflink_to_dir_toc(
+    storage: &Storage,
+    image: &cstor_rs::Image,
+    dest_dir: &Dir,
+    dest: &std::path::Path,
+    force_copy: bool,
+) -> Result<()> {
+    use cstor_rs::Toc;
+    use std::collections::HashMap;
+
     // Build merged TOC with layer mapping
     // This properly handles whiteouts - files deleted in upper layers won't appear
     let (toc, layer_map) =
-        Toc::from_image_with_layers(storage, &image).context("Failed to build merged TOC")?;
+        Toc::from_image_with_layers(storage, image).context("Failed to build merged TOC")?;
 
     eprintln!(
         "Extracting {} entries to {}",
@@ -599,10 +624,94 @@ fn reflink_to_dir(
         }
         let layer = layer_cache.get(layer_id).unwrap();
 
-        extract_toc_entry(&dest_dir, layer, entry, force_copy)?;
+        extract_toc_entry(dest_dir, layer, entry, force_copy)?;
     }
 
     eprintln!("Successfully extracted image to {}", dest.display());
+    Ok(())
+}
+
+/// Extract image using splitfdstream approach.
+fn reflink_to_dir_splitfdstream(
+    storage: &Storage,
+    image: &cstor_rs::Image,
+    dest_dir: &Dir,
+    dest: &std::path::Path,
+    force_copy: bool,
+) -> Result<()> {
+    use cstor_rs::splitfdstream::extract_to_dir;
+    use cstor_rs::{DEFAULT_INLINE_THRESHOLD, layer_to_splitfdstream};
+
+    let layer_ids = image.layers().context("Failed to get layer IDs")?;
+
+    eprintln!(
+        "Extracting {} layers to {} (using splitfdstream)",
+        layer_ids.len(),
+        dest.display()
+    );
+
+    let mut total_stats = cstor_rs::splitfdstream::ExtractionStats::default();
+
+    // Process each layer in order (base to top)
+    // Process each layer in order (base to top), with later layers overwriting
+    // earlier ones. Whiteout files are processed for proper overlay semantics:
+    // - Regular whiteouts (.wh.<name>) remove the target file/directory
+    // - Opaque whiteouts (.wh..wh..opq) clear all contents from the directory
+    for (i, layer_id) in layer_ids.iter().enumerate() {
+        eprintln!(
+            "[{}/{}] Processing layer: {}",
+            i + 1,
+            layer_ids.len(),
+            layer_id
+        );
+
+        let layer = Layer::open(storage, layer_id)
+            .with_context(|| format!("Failed to open layer {}", layer_id))?;
+
+        // Convert layer to splitfdstream
+        let splitfd = layer_to_splitfdstream(storage, &layer, DEFAULT_INLINE_THRESHOLD)
+            .with_context(|| format!("Failed to convert layer {} to splitfdstream", layer_id))?;
+
+        // Extract from splitfdstream
+        let stats = extract_to_dir(
+            splitfd.stream.as_slice(),
+            &splitfd.files,
+            dest_dir,
+            force_copy,
+        )
+        .with_context(|| format!("Failed to extract layer {}", layer_id))?;
+
+        eprintln!(
+            "  {} files, {} dirs, {} symlinks, {} whiteouts, {} bytes reflinked, {} bytes copied, {} bytes inline",
+            stats.files_extracted,
+            stats.directories_created,
+            stats.symlinks_created,
+            stats.whiteouts_processed,
+            stats.bytes_reflinked,
+            stats.bytes_copied,
+            stats.bytes_inline
+        );
+
+        // Accumulate stats
+        total_stats.files_extracted += stats.files_extracted;
+        total_stats.directories_created += stats.directories_created;
+        total_stats.symlinks_created += stats.symlinks_created;
+        total_stats.hardlinks_created += stats.hardlinks_created;
+        total_stats.whiteouts_processed += stats.whiteouts_processed;
+        total_stats.bytes_reflinked += stats.bytes_reflinked;
+        total_stats.bytes_copied += stats.bytes_copied;
+        total_stats.bytes_inline += stats.bytes_inline;
+    }
+
+    eprintln!(
+        "Successfully extracted image to {} ({} files, {} dirs, {} bytes reflinked, {} bytes copied)",
+        dest.display(),
+        total_stats.files_extracted,
+        total_stats.directories_created,
+        total_stats.bytes_reflinked,
+        total_stats.bytes_copied
+    );
+
     Ok(())
 }
 
@@ -746,155 +855,143 @@ fn output_toc(storage: &Storage, image_id: &str, pretty: bool) -> Result<()> {
 ///
 /// This function demonstrates the JSON-RPC fd-passing protocol by:
 /// 1. Creating a socketpair
-/// 2. Spawning a tokio task to act as the "server" streaming tar-split data
-/// 3. Acting as the "client" receiving messages and reconstructing the tar
+/// 2. Spawning a tokio task to run the RpcServer
+/// 3. Acting as the client sending GetLayerSplitfdstream request
+/// 4. Receiving the response with file descriptors
+/// 5. Reconstructing the tar from splitfdstream + fds
 ///
 /// This validates that the wire format works correctly over Unix sockets.
 fn export_layer_ipc(storage: &Storage, layer_id: &str, output: Option<PathBuf>) -> Result<()> {
-    use cstor_rs::client::TarSplitClient;
-    use tokio::io::AsyncWriteExt;
+    use cstor_rs::protocol::GetLayerSplitfdstreamParams;
+    use cstor_rs::server::RpcServer;
+    use cstor_rs::splitfdstream::reconstruct_tar_seekable;
+    use jsonrpc_fdpass::transport::UnixSocketTransport;
+    use jsonrpc_fdpass::{JsonRpcMessage, JsonRpcRequest, MessageWithFds};
+    use std::io::Read;
     use tokio::net::UnixStream;
 
-    // Validate the layer exists and get what we need
-    let layer = Layer::open(storage, layer_id).context("Failed to open layer")?;
+    // Validate the layer exists before setting up IPC
+    let _layer = Layer::open(storage, layer_id).context("Failed to open layer")?;
 
-    // We need to run both server and client in the same tokio runtime
-    // because ndjson-rpc-fdpass uses spawn_blocking internally.
-    // Since Storage is not Send, we do the tar-split iteration synchronously
-    // and collect the items first.
+    // For the server task, we need to re-discover storage since Storage is not Clone.
+    // This is acceptable for a PoC - in production, the server would be a separate process.
+    let _ = storage; // We've validated the layer, now drop reference
 
-    // Collect all tar-split items first (sync)
-    use cstor_rs::tar_split::{TarSplitFdStream, TarSplitItem};
-    let mut stream =
-        TarSplitFdStream::new(storage, &layer).context("Failed to create tar-split stream")?;
+    // Create tokio runtime for async operations
+    let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
 
-    let mut items = Vec::new();
-    while let Some(item) = stream.next()? {
-        items.push(item);
-    }
-
-    // Now run the async IPC in a single runtime
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("Failed to create tokio runtime")?;
-
-    let file_count = runtime.block_on(async move {
-        // Create socketpair using tokio (creates non-blocking sockets)
+    rt.block_on(async {
+        // Create a socketpair for IPC
         let (server_sock, client_sock) =
-            UnixStream::pair().context("Failed to create socketpair")?;
+            UnixStream::pair().context("Failed to create socket pair")?;
 
-        // Spawn server task
-        let server_task = tokio::spawn(async move {
-            use base64::prelude::*;
-            use cstor_rs::protocol::{FdPlaceholder, StreamMessage};
-            use ndjson_rpc_fdpass::transport::UnixSocketTransport;
-            use ndjson_rpc_fdpass::{JsonRpcMessage, JsonRpcNotification, MessageWithFds};
-            use std::collections::HashMap;
-
-            let transport = UnixSocketTransport::new(server_sock)
-                .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?;
-            let (mut sender, _receiver) = transport.split();
-
-            // Send start message
-            let start_msg = StreamMessage::Start { segments_fd: None };
-            let notification = JsonRpcNotification::new(
-                "stream.start".to_string(),
-                Some(serde_json::to_value(&start_msg).unwrap()),
-            );
-            let message = JsonRpcMessage::Notification(notification);
-            sender
-                .send(MessageWithFds::new(message, vec![]))
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send start: {}", e))?;
-
-            // Send all items
-            for item in items {
-                match item {
-                    TarSplitItem::Segment(bytes) => {
-                        let data = BASE64_STANDARD.encode(&bytes);
-                        let msg = StreamMessage::Seg { data };
-                        let notification = JsonRpcNotification::new(
-                            "stream.seg".to_string(),
-                            Some(serde_json::to_value(&msg).unwrap()),
-                        );
-                        let message = JsonRpcMessage::Notification(notification);
-                        sender
-                            .send(MessageWithFds::new(message, vec![]))
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Failed to send seg: {}", e))?;
-                    }
-                    TarSplitItem::FileContent { fd, size, name } => {
-                        let msg = StreamMessage::File {
-                            name,
-                            size,
-                            digests: HashMap::new(),
-                            fd: FdPlaceholder::new(0),
-                        };
-                        let notification = JsonRpcNotification::new(
-                            "stream.file".to_string(),
-                            Some(serde_json::to_value(&msg).unwrap()),
-                        );
-                        let message = JsonRpcMessage::Notification(notification);
-                        sender
-                            .send(MessageWithFds::new(message, vec![fd]))
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Failed to send file: {}", e))?;
-                    }
-                }
-            }
-
-            // Send end message
-            let end_msg = StreamMessage::End;
-            let notification = JsonRpcNotification::new(
-                "stream.end".to_string(),
-                Some(serde_json::to_value(&end_msg).unwrap()),
-            );
-            let message = JsonRpcMessage::Notification(notification);
-            sender
-                .send(MessageWithFds::new(message, vec![]))
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send end: {}", e))?;
-
-            Ok::<(), anyhow::Error>(())
+        // Spawn the server in a blocking task since Storage contains rusqlite which is not Send
+        let layer_id_clone = layer_id.to_string();
+        let server_handle = tokio::task::spawn_blocking(move || {
+            // Create a new runtime for the server since we're in spawn_blocking
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create server runtime");
+            rt.block_on(async move {
+                let server_storage =
+                    Storage::discover().expect("Failed to discover storage in server task");
+                let mut server = RpcServer::new(server_sock, server_storage)
+                    .expect("Failed to create RpcServer");
+                server.run().await.expect("Server failed");
+            });
         });
 
-        // Client side
-        let mut client = TarSplitClient::new(client_sock).context("Failed to create client")?;
+        // Client side: create transport and send request
+        let transport = UnixSocketTransport::new(client_sock)
+            .map_err(|e| anyhow!("Failed to create client transport: {}", e))?;
+        let (mut sender, mut receiver) = transport.split();
 
-        let file_count = if let Some(path) = output {
-            let mut file = tokio::fs::File::create(&path)
-                .await
-                .context("Failed to create output file")?;
-            let count = client
-                .receive_to_tar(&mut file)
-                .await
-                .context("Failed to receive tar stream")?;
-            file.flush().await.context("Failed to flush output")?;
-            count
-        } else {
-            let mut stdout = tokio::io::stdout();
-            let count = client
-                .receive_to_tar(&mut stdout)
-                .await
-                .context("Failed to receive tar stream")?;
-            stdout.flush().await.context("Failed to flush stdout")?;
-            count
+        // Send GetLayerSplitfdstream request
+        let params = GetLayerSplitfdstreamParams {
+            layer: layer_id_clone,
+            compressed: false,
+        };
+        let request = JsonRpcRequest::new(
+            "GetLayerSplitfdstream".to_string(),
+            Some(serde_json::to_value(&params).context("Failed to serialize params")?),
+            serde_json::Value::Number(1.into()),
+        );
+        let message = MessageWithFds::new(JsonRpcMessage::Request(request), vec![]);
+        sender
+            .send(message)
+            .await
+            .map_err(|e| anyhow!("Failed to send request: {}", e))?;
+
+        // Receive response with fds
+        let response = receiver
+            .receive()
+            .await
+            .map_err(|e| anyhow!("Failed to receive response: {}", e))?;
+
+        // Check for errors in response
+        let resp = match response.message {
+            JsonRpcMessage::Response(r) => r,
+            other => anyhow::bail!("Expected Response, got {:?}", other),
         };
 
-        // Wait for server task
-        server_task
-            .await
-            .map_err(|e| anyhow::anyhow!("Server task panicked: {}", e))?
-            .context("Server task error")?;
+        if let Some(error) = resp.error {
+            anyhow::bail!(
+                "Server returned error {}: {}",
+                error.code(),
+                error.message()
+            );
+        }
 
-        Ok::<usize, anyhow::Error>(file_count)
-    })?;
+        // Extract fds: fd[0] = splitfdstream, fd[1..n] = content fds
+        let mut fds = response.file_descriptors;
+        if fds.is_empty() {
+            anyhow::bail!("No file descriptors received in response");
+        }
 
-    eprintln!(
-        "Exported {} files from layer {} via IPC protocol",
-        file_count, layer_id
-    );
+        // fd[0] is the splitfdstream data
+        let stream_fd = fds.remove(0);
+        let content_fds = fds; // remaining fds are content
 
-    Ok(())
+        // Read the splitfdstream from the memfd
+        let mut stream_file = std::fs::File::from(stream_fd);
+        let mut stream_data = Vec::new();
+        stream_file
+            .read_to_end(&mut stream_data)
+            .context("Failed to read splitfdstream from fd")?;
+
+        // Reconstruct the tar to output
+        let mut output_writer: Box<dyn Write> = match &output {
+            Some(path) => Box::new(
+                File::create(path)
+                    .with_context(|| format!("Failed to create output file: {}", path.display()))?,
+            ),
+            None => Box::new(io::stdout().lock()),
+        };
+
+        // Convert OwnedFds to Files for read_at
+        let content_files: Vec<std::fs::File> =
+            content_fds.into_iter().map(std::fs::File::from).collect();
+
+        let bytes_written =
+            reconstruct_tar_seekable(stream_data.as_slice(), &content_files, &mut output_writer)
+                .context("Failed to reconstruct tar from splitfdstream")?;
+
+        // Drop sender to close the connection, allowing server to exit
+        drop(sender);
+        drop(receiver);
+
+        // Wait for server to finish (with timeout)
+        tokio::select! {
+            result = server_handle => {
+                result.context("Server task panicked")?;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                // Server didn't exit cleanly, but that's OK for this PoC
+            }
+        }
+
+        if output.is_some() {
+            eprintln!("Wrote {} bytes via IPC protocol", bytes_written);
+        }
+
+        Ok(())
+    })
 }

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Read-only access to containers-storage overlay driver.
 //!
 //! This library provides efficient, capability-based access to container image
@@ -11,6 +12,10 @@
 //! requiring tar serialization. Instead, it provides direct file descriptor access
 //! to layer content, enabling zero-copy operations.
 //!
+//! For streaming layers over IPC, the [`splitfdstream`] format allows tar archives
+//! to reference external file descriptors for large file content, enabling efficient
+//! transfer via Unix sockets with fd passing.
+//!
 //! # Key Features
 //!
 //! - **Capability-based security**: All file access via `cap_std::fs::Dir` handles
@@ -19,6 +24,7 @@
 //! - **Safe by design**: No path traversal vulnerabilities
 //! - **Tar-split integration**: Bit-for-bit identical TAR reconstruction
 //! - **OCI compatibility**: Uses oci-spec and ocidir for standard image formats
+//! - **IPC streaming**: JSON-RPC protocol with fd passing for layer transfer
 //!
 //! # Example
 //!
@@ -66,19 +72,30 @@
 //! cstor-rs toc <image-id> --pretty
 //! ```
 
-pub mod client;
+// Core storage access
 pub mod config;
 pub mod error;
-pub mod generic_tree;
 pub mod image;
 pub mod layer;
-pub mod protocol;
-pub mod proxy_v2;
-pub mod server;
 pub mod storage;
+
+// Tar handling
 pub mod tar_split;
 pub mod tar_writer;
 pub mod toc;
+
+// Splitfdstream binary format
+pub mod splitfdstream;
+
+// IPC protocol (JSON-RPC with fd passing)
+pub mod client;
+pub mod protocol;
+pub mod server;
+
+// Utilities
+pub mod generic_tree;
+pub mod proxy_v2;
+mod readatreader;
 
 // Re-export commonly used types
 pub use config::{AdditionalLayerStore, StorageConfig};
@@ -87,7 +104,10 @@ pub use generic_tree::{FileSystem, Inode, TreeError};
 pub use image::Image;
 pub use layer::Layer;
 pub use storage::Storage;
-pub use tar_split::{TarHeader, TarSplitFdStream, TarSplitItem};
+pub use tar_split::{
+    DEFAULT_INLINE_THRESHOLD, LayerSplitfdstream, TarHeader, TarSplitFdStream, TarSplitItem,
+    layer_to_splitfdstream,
+};
 pub use tar_writer::{write_file_data, write_tar_footer, write_tar_header};
 pub use toc::{Toc, TocEntry, TocEntryType};
 

@@ -35,7 +35,7 @@
 //! - Efficient for deep layer chains as parent layers are only opened when needed
 
 use std::io::{BufRead, BufReader};
-use std::os::unix::io::OwnedFd;
+use std::os::fd::OwnedFd;
 
 use base64::prelude::*;
 use cap_std::fs::{Dir, File};
@@ -846,6 +846,130 @@ fn open_file_as_fd(layer: &Layer, path: &str) -> Result<OwnedFd> {
     Ok(owned_fd)
 }
 
+/// Default inline threshold for splitfdstream production (4KB).
+///
+/// Files smaller than or equal to this size are embedded inline in the
+/// splitfdstream, while larger files are referenced as external file descriptors.
+pub const DEFAULT_INLINE_THRESHOLD: u64 = 4096;
+
+/// Result of producing a splitfdstream from a layer.
+///
+/// Contains the serialized splitfdstream data and a list of files
+/// for content that exceeded the inline threshold.
+#[derive(Debug)]
+pub struct LayerSplitfdstream {
+    /// The splitfdstream data containing inline chunks and external references.
+    pub stream: Vec<u8>,
+
+    /// Files for external content, in order referenced by stream.
+    /// The stream's external reference at index N corresponds to `files[N]`.
+    pub files: Vec<std::fs::File>,
+}
+
+/// Convert a layer to splitfdstream format.
+///
+/// This function reads the tar-split metadata for a layer and produces a
+/// splitfdstream that can be used to reconstruct the original tar archive.
+/// The splitfdstream format encodes:
+/// - Small data inline (tar headers, padding, small files)
+/// - Large file content as external fd references
+///
+/// # Arguments
+///
+/// * `storage` - Storage handle for accessing layer data
+/// * `layer` - Layer to convert to splitfdstream
+/// * `inline_threshold` - Maximum size for inline content. Files larger than
+///   this become external fd references. Use [`DEFAULT_INLINE_THRESHOLD`] for
+///   the default of 4KB.
+///
+/// # Returns
+///
+/// A [`LayerSplitfdstream`] containing the stream data and external file
+/// descriptors.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The tar-split metadata cannot be read
+/// - A file referenced in the tar-split cannot be opened
+/// - CRC64 verification fails for any file
+///
+/// # Example
+///
+/// ```no_run
+/// use cstor_rs::{Storage, Layer, layer_to_splitfdstream, DEFAULT_INLINE_THRESHOLD};
+///
+/// let storage = Storage::discover()?;
+/// let layer = Layer::open(&storage, "layer-id")?;
+/// let result = layer_to_splitfdstream(&storage, &layer, DEFAULT_INLINE_THRESHOLD)?;
+///
+/// println!("Stream size: {} bytes", result.stream.len());
+/// println!("External fds: {}", result.files.len());
+/// # Ok::<(), cstor_rs::StorageError>(())
+/// ```
+pub fn layer_to_splitfdstream(
+    storage: &Storage,
+    layer: &Layer,
+    inline_threshold: u64,
+) -> Result<LayerSplitfdstream> {
+    use crate::splitfdstream::SplitfdstreamWriter;
+    use std::io::Read;
+
+    let mut stream = TarSplitFdStream::new(storage, layer)?;
+    let mut buffer = Vec::new();
+    let mut writer = SplitfdstreamWriter::new(&mut buffer);
+    let mut files = Vec::new();
+
+    while let Some(item) = stream.next()? {
+        match item {
+            TarSplitItem::Segment(bytes) => {
+                // Segments (tar headers, padding) always go inline
+                writer.write_inline(&bytes).map_err(|e| {
+                    StorageError::TarSplitError(format!("Failed to write inline segment: {}", e))
+                })?;
+            }
+            TarSplitItem::FileContent { fd, size, name } => {
+                if size <= inline_threshold {
+                    // Small file - read content and inline it
+                    let mut file = std::fs::File::from(fd);
+                    let mut content = vec![0u8; size as usize];
+                    file.read_exact(&mut content).map_err(|e| {
+                        StorageError::TarSplitError(format!(
+                            "Failed to read file content for {}: {}",
+                            name, e
+                        ))
+                    })?;
+                    writer.write_inline(&content).map_err(|e| {
+                        StorageError::TarSplitError(format!(
+                            "Failed to write inline content for {}: {}",
+                            name, e
+                        ))
+                    })?;
+                } else {
+                    // Large file - external fd reference
+                    let fd_index = files.len() as u32;
+                    writer.write_external(fd_index).map_err(|e| {
+                        StorageError::TarSplitError(format!(
+                            "Failed to write external reference for {}: {}",
+                            name, e
+                        ))
+                    })?;
+                    files.push(std::fs::File::from(fd));
+                }
+            }
+        }
+    }
+
+    writer.finish().map_err(|e| {
+        StorageError::TarSplitError(format!("Failed to finish splitfdstream: {}", e))
+    })?;
+
+    Ok(LayerSplitfdstream {
+        stream: buffer,
+        files,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -999,5 +1123,65 @@ mod tests {
         let header = [0u8; 512];
         let result = TarHeader::from_bytes(&header);
         assert!(result.is_err(), "Padding block should be rejected");
+    }
+
+    #[test]
+    fn test_default_inline_threshold() {
+        // Verify the default threshold is 4KB
+        assert_eq!(DEFAULT_INLINE_THRESHOLD, 4096);
+    }
+
+    #[test]
+    #[ignore] // Requires actual storage with tar-split files
+    fn test_layer_to_splitfdstream() {
+        // This test requires a real container storage with layers
+        // Run with: cargo test test_layer_to_splitfdstream -- --ignored
+        use crate::Storage;
+
+        let storage = Storage::discover().expect("Storage should be available");
+        let images = storage.list_images().expect("Should list images");
+
+        if let Some(image) = images.first() {
+            let layers = storage.get_image_layers(image).expect("Should get layers");
+
+            if let Some(layer) = layers.first() {
+                let result = layer_to_splitfdstream(&storage, layer, DEFAULT_INLINE_THRESHOLD)
+                    .expect("Should produce splitfdstream");
+
+                // Basic sanity checks
+                assert!(!result.stream.is_empty(), "Stream should not be empty");
+
+                // The stream should be parseable
+                use crate::splitfdstream::{Chunk, SplitfdstreamReader};
+                let mut reader = SplitfdstreamReader::new(result.stream.as_slice());
+                let mut chunk_count = 0;
+                let mut max_external_idx: Option<u32> = None;
+
+                while let Some(chunk) = reader.next_chunk().expect("Should parse chunks") {
+                    chunk_count += 1;
+                    if let Chunk::External(idx) = chunk {
+                        max_external_idx = Some(max_external_idx.map_or(idx, |m| m.max(idx)));
+                    }
+                }
+
+                assert!(chunk_count > 0, "Should have at least one chunk");
+
+                // If we have external references, verify fd count matches
+                if let Some(max_idx) = max_external_idx {
+                    assert!(
+                        result.files.len() > max_idx as usize,
+                        "Should have enough fds for all external references"
+                    );
+                }
+
+                println!(
+                    "Layer {} produced {} bytes stream with {} external fds, {} chunks",
+                    layer.id,
+                    result.stream.len(),
+                    result.files.len(),
+                    chunk_count
+                );
+            }
+        }
     }
 }
