@@ -1578,6 +1578,142 @@ impl ProxiedStorage {
             StorageMode::Proxied { proxy, .. } => proxy.shutdown().await,
         }
     }
+
+    /// Extract a layer to a directory.
+    ///
+    /// This extracts all files from the layer to the destination directory,
+    /// using reflinks when possible for efficient zero-copy extraction.
+    /// Works transparently in both direct and proxied modes.
+    ///
+    /// # Arguments
+    ///
+    /// * `layer_id` - Layer ID to extract
+    /// * `dest` - Destination directory handle
+    /// * `options` - Extraction options
+    ///
+    /// # Returns
+    ///
+    /// Statistics about the extraction.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::userns_helper::ProxiedStorage;
+    /// use cstor_rs::extract::ExtractionOptions;
+    /// use cap_std::fs::Dir;
+    /// use cap_std::ambient_authority;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut storage = ProxiedStorage::open_with_proxy("/path/to/storage").await?;
+    /// let dest = Dir::open_ambient_dir("/tmp/extract", ambient_authority())?;
+    /// let options = ExtractionOptions::default();
+    ///
+    /// let stats = storage.extract_layer("layer-id", &dest, &options).await?;
+    /// println!("Extracted {} files", stats.files_extracted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn extract_layer(
+        &mut self,
+        layer_id: &str,
+        dest: &cap_std::fs::Dir,
+        options: &crate::extract::ExtractionOptions,
+    ) -> std::result::Result<crate::extract::ExtractionStats, HelperError> {
+        match &mut self.mode {
+            StorageMode::Direct(storage) => {
+                let layer = Layer::open(storage, layer_id)
+                    .map_err(|e| HelperError::HelperError(format!("layer not found: {}", e)))?;
+                crate::extract::extract_layer(storage, &layer, dest, options)
+                    .map_err(|e| HelperError::HelperError(format!("extraction failed: {}", e)))
+            }
+            StorageMode::Proxied { proxy, path } => {
+                // Stream layer content via IPC and extract
+                let mut stream = proxy
+                    .stream_layer(path.to_str().unwrap_or("."), layer_id)
+                    .await?;
+
+                // Use the extract_from_stream function with an async closure adapter
+                // Since extract_from_stream expects a sync closure but we have an async stream,
+                // we need to collect items first or use a different approach
+                let mut items = Vec::new();
+                while let Some(item) = stream.next().await? {
+                    items.push(item);
+                }
+
+                let mut iter = items.into_iter();
+                crate::extract::extract_from_stream(dest, options, || Ok(iter.next()))
+                    .map_err(|e| HelperError::HelperError(format!("extraction failed: {}", e)))
+            }
+        }
+    }
+
+    /// Extract an image (all layers merged) to a directory.
+    ///
+    /// This extracts all layers in order, applying overlay semantics:
+    /// - Upper layer files override lower layer files
+    /// - Whiteouts remove files from lower layers
+    ///
+    /// # Arguments
+    ///
+    /// * `image_ref` - Image ID or name
+    /// * `dest` - Destination directory handle
+    /// * `options` - Extraction options
+    ///
+    /// # Returns
+    ///
+    /// Statistics about the extraction.
+    pub async fn extract_image(
+        &mut self,
+        image_ref: &str,
+        dest: &cap_std::fs::Dir,
+        options: &crate::extract::ExtractionOptions,
+    ) -> std::result::Result<crate::extract::ExtractionStats, HelperError> {
+        // Get image info and layer IDs first
+        let image_result = self.get_image(image_ref).await?;
+        let layer_diff_ids = image_result.layer_diff_ids.clone();
+
+        match &mut self.mode {
+            StorageMode::Direct(storage) => {
+                let image = storage
+                    .get_image(image_ref)
+                    .or_else(|_| storage.find_image_by_name(image_ref))
+                    .map_err(|e| HelperError::HelperError(format!("image not found: {}", e)))?;
+                crate::extract::extract_image(storage, &image, dest, options)
+                    .map_err(|e| HelperError::HelperError(format!("extraction failed: {}", e)))
+            }
+            StorageMode::Proxied { .. } => {
+                let mut total_stats = crate::extract::ExtractionStats::default();
+
+                // Extract each layer in order
+                for diff_id in &layer_diff_ids {
+                    // Try to get layer metadata to find storage ID
+                    let layer_id = match self.get_layer_metadata(diff_id).await {
+                        Ok(metadata) => metadata.id,
+                        Err(_) => {
+                            // Try with diff_id directly (stripped of sha256: prefix)
+                            diff_id
+                                .strip_prefix("sha256:")
+                                .unwrap_or(diff_id)
+                                .to_string()
+                        }
+                    };
+
+                    let layer_stats = self.extract_layer(&layer_id, dest, options).await?;
+
+                    total_stats.files_extracted += layer_stats.files_extracted;
+                    total_stats.directories_created += layer_stats.directories_created;
+                    total_stats.symlinks_created += layer_stats.symlinks_created;
+                    total_stats.hardlinks_created += layer_stats.hardlinks_created;
+                    total_stats.bytes_reflinked += layer_stats.bytes_reflinked;
+                    total_stats.bytes_copied += layer_stats.bytes_copied;
+                    total_stats.whiteouts_processed += layer_stats.whiteouts_processed;
+                    total_stats.entries_skipped += layer_stats.entries_skipped;
+                }
+
+                Ok(total_stats)
+            }
+        }
+    }
 }
 
 /// Unified stream of layer content items.

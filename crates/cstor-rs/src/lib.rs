@@ -20,11 +20,13 @@
 //!
 //! - **Capability-based security**: All file access via `cap_std::fs::Dir` handles
 //! - **Layer creation**: Build new layers with reflink support
+//! - **Layer extraction**: Extract layers/images with reflink support for zero-copy
 //! - **Zero-copy access**: File descriptors instead of data copies
 //! - **Safe by design**: No path traversal vulnerabilities
 //! - **Tar-split integration**: Bit-for-bit identical TAR reconstruction
 //! - **OCI compatibility**: Uses oci-spec and ocidir for standard image formats
 //! - **IPC streaming**: JSON-RPC protocol with fd passing for layer transfer
+//! - **User namespace support**: Transparent proxied access for unprivileged users
 //!
 //! # Example
 //!
@@ -88,6 +90,9 @@ pub mod toc;
 // Layer creation
 pub mod layer_builder;
 
+// Layer extraction
+pub mod extract;
+
 // Splitfdstream binary format
 pub mod splitfdstream;
 
@@ -127,6 +132,11 @@ pub use toc::{Toc, TocEntry, TocEntryType};
 // Layer creation exports
 pub use layer_builder::LayerBuilder;
 pub use tar_split_writer::TarSplitWriter;
+
+// Layer extraction exports
+pub use extract::{
+    ExtractionOptions, ExtractionStats, extract_image, extract_image_with_toc, extract_layer,
+};
 
 // Re-export OCI spec types for convenience
 pub use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest};
