@@ -37,12 +37,11 @@
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-use std::os::unix::io::{AsRawFd, BorrowedFd};
-use std::path::{Path, PathBuf};
+use std::os::unix::io::BorrowedFd;
+use std::path::Path;
 
-use cap_std::fs::Dir;
-use rustix::fs::{Mode, ioctl_ficlone};
+use cap_std::fs::{Dir, MetadataExt, OpenOptions, Permissions, PermissionsExt};
+use rustix::fs::{AtFlags, Gid, Mode, Uid, ioctl_ficlone};
 
 use crate::error::{Result, StorageError};
 use crate::storage::Storage;
@@ -100,23 +99,11 @@ pub struct LayerBuilder {
     /// The storage root.
     storage_root: Dir,
 
-    /// Handle to the staging parent directory (.staging/).
-    /// Kept alive to make `/proc/self/fd/{fd}` paths valid.
-    #[allow(dead_code)]
-    staging_parent_handle: Dir,
-
     /// Handle to the staging directory for this layer.
-    /// Kept alive to make `/proc/self/fd/{fd}` paths valid.
-    #[allow(dead_code)]
     staging_handle: Dir,
 
     /// Handle to the diff directory where files are placed.
-    /// Kept alive to make the diff_dir path (via /proc/self/fd/) valid.
-    #[allow(dead_code)]
     diff_handle: Dir,
-
-    /// The diff directory path (as /proc/self/fd path).
-    diff_dir: PathBuf,
 
     /// Parent layer ID (if any).
     parent_id: Option<String>,
@@ -169,16 +156,10 @@ impl LayerBuilder {
         staging.create_dir("diff")?;
         let diff_handle = staging.open_dir("diff")?;
 
-        // Get path to diff directory for file operations.
-        // We use /proc/self/fd/{fd} to access via the open handle.
-        let diff_dir = PathBuf::from(format!("/proc/self/fd/{}", diff_handle.as_raw_fd()));
-
         Ok(Self {
             storage_root,
-            staging_parent_handle: staging_parent,
             staging_handle: staging,
             diff_handle,
-            diff_dir,
             parent_id: parent_id.map(|s| s.to_string()),
             entries: Vec::new(),
             layer_id,
@@ -200,8 +181,7 @@ impl LayerBuilder {
     fn ensure_parent_dirs(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                let full_path = self.diff_dir.join(parent);
-                std::fs::create_dir_all(&full_path)?;
+                self.diff_handle.create_dir_all(parent)?;
             }
         }
         Ok(())
@@ -230,10 +210,8 @@ impl LayerBuilder {
         let path = path.as_ref();
         self.ensure_parent_dirs(path)?;
 
-        let dest_path = self.diff_dir.join(path);
-
-        // Create destination file
-        let dest_file = File::create(&dest_path)?;
+        // Create destination file using the Dir handle
+        let dest_file: File = self.diff_handle.create(path)?.into_std();
 
         // Try reflink first
         let reflink_result = try_reflink(&dest_file, src_fd);
@@ -248,7 +226,10 @@ impl LayerBuilder {
                     StorageError::Io(std::io::Error::from_raw_os_error(e.raw_os_error()))
                 })?);
                 src.seek(SeekFrom::Start(0))?;
-                let mut dest = File::options().write(true).open(&dest_path)?;
+                let mut dest = self
+                    .diff_handle
+                    .open_with(path, OpenOptions::new().write(true))?
+                    .into_std();
                 std::io::copy(&mut src, &mut dest)?;
             }
             Err(e) => return Err(e),
@@ -282,8 +263,7 @@ impl LayerBuilder {
         let path = path.as_ref();
         self.ensure_parent_dirs(path)?;
 
-        let dest_path = self.diff_dir.join(path);
-        let mut dest_file = File::create(&dest_path)?;
+        let mut dest_file: File = self.diff_handle.create(path)?.into_std();
         dest_file.write_all(content)?;
 
         // Set permissions (best effort)
@@ -316,13 +296,20 @@ impl LayerBuilder {
         let path = path.as_ref();
         self.ensure_parent_dirs(path)?;
 
-        let dest_path = self.diff_dir.join(path);
-        std::fs::create_dir(&dest_path)?;
+        self.diff_handle.create_dir(path)?;
 
         // Set permissions (best effort - may fail in rootless mode)
-        let _ = std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(mode));
+        let _ = self
+            .diff_handle
+            .set_permissions(path, Permissions::from_mode(mode));
         // Note: chown requires root or CAP_CHOWN
-        let _ = std::os::unix::fs::chown(&dest_path, Some(uid), Some(gid));
+        let _ = rustix::fs::chownat(
+            &self.diff_handle,
+            path,
+            Some(Uid::from_raw(uid)),
+            Some(Gid::from_raw(gid)),
+            AtFlags::empty(),
+        );
 
         // Track entry
         self.entries.push(TocEntry {
@@ -363,11 +350,17 @@ impl LayerBuilder {
         let path = path.as_ref();
         self.ensure_parent_dirs(path)?;
 
-        let dest_path = self.diff_dir.join(path);
-        symlink(target, &dest_path)?;
+        // symlink_contents allows the target to be any path (including non-existent)
+        self.diff_handle.symlink_contents(target, path)?;
 
         // Note: lchown for symlinks requires root
-        let _ = std::os::unix::fs::lchown(&dest_path, Some(uid), Some(gid));
+        let _ = rustix::fs::chownat(
+            &self.diff_handle,
+            path,
+            Some(Uid::from_raw(uid)),
+            Some(Gid::from_raw(gid)),
+            AtFlags::SYMLINK_NOFOLLOW,
+        );
 
         // Track entry
         self.entries.push(TocEntry {
@@ -400,12 +393,12 @@ impl LayerBuilder {
         let path = path.as_ref();
         self.ensure_parent_dirs(path)?;
 
-        let dest_path = self.diff_dir.join(path);
-        let target_path = self.diff_dir.join(target);
-        std::fs::hard_link(&target_path, &dest_path)?;
+        // hard_link(old, new) - creates `new` as a hard link to `old`
+        self.diff_handle
+            .hard_link(target, &self.diff_handle, path)?;
 
         // Get metadata from target
-        let metadata = std::fs::metadata(&target_path)?;
+        let metadata = self.diff_handle.metadata(target)?;
 
         // Track entry
         self.entries.push(TocEntry {
@@ -461,15 +454,10 @@ impl LayerBuilder {
         overlay_dir.create_dir(&self.layer_id)?;
         let layer_dir = overlay_dir.open_dir(&self.layer_id)?;
 
-        // Move diff directory
+        // Move diff directory from staging to final location
         // Note: This requires same filesystem for rename
         // If cross-filesystem, we'd need to copy
-        let staging_layers = self.storage_root.open_dir("overlay-layers")?;
-        let staging_parent = staging_layers.open_dir(".staging")?;
-        let staging = staging_parent.open_dir(&self.layer_id)?;
-
-        // Rename diff directory from staging to final location
-        staging.rename("diff", &layer_dir, "diff")?;
+        self.staging_handle.rename("diff", &layer_dir, "diff")?;
 
         // Create link file
         layer_dir.write("link", self.link_id.as_bytes())?;
@@ -506,6 +494,10 @@ impl LayerBuilder {
         self.update_layers_json()?;
 
         // Clean up staging directory
+        let staging_parent = self
+            .storage_root
+            .open_dir("overlay-layers")?
+            .open_dir(".staging")?;
         staging_parent.remove_dir(&self.layer_id)?;
 
         Ok(self.layer_id.clone())
@@ -522,8 +514,7 @@ impl LayerBuilder {
         for entry in &sorted_entries {
             if entry.entry_type == TocEntryType::Reg && entry.size.unwrap_or(0) > 0 {
                 // Open file for CRC64 computation
-                let file_path = self.diff_dir.join(&entry.name);
-                let file = File::open(&file_path)?;
+                let file: File = self.diff_handle.open(&entry.name)?.into_std();
                 writer.add_toc_entry(entry, Some(file))?;
             } else {
                 // Directory, symlink, etc. - no content
