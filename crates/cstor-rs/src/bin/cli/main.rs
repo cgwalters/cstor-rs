@@ -35,17 +35,15 @@ use cap_std::fs::{Dir, Permissions};
 use clap::{Parser, Subcommand};
 use cstor_rs::*;
 use output::{
-    format_time_ago, output_item, output_slice, ImageInspectOutput, ImageListEntry, LayerInfo,
-    LayerInspectOutput, OutputFormat, truncate_id,
+    ImageInspectOutput, ImageListEntry, LayerInfo, LayerInspectOutput, OutputFormat,
+    format_time_ago, output_item, output_slice, truncate_id,
 };
 use sha2::Digest;
 use std::fs::File;
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
 
 /// Environment variable set when we've re-execed into a user namespace
 const USERNS_ENV: &str = "CSTOR_IN_USERNS";
@@ -194,51 +192,13 @@ enum LayerCommands {
     },
 }
 
-/// Check if we need to enter a user namespace for file access.
-///
-/// Returns `true` if we're running as a non-root user and haven't already
-/// re-execed into a user namespace via `podman unshare`.
-fn needs_userns() -> bool {
-    // Already in userns from our re-exec
-    if std::env::var(USERNS_ENV).is_ok() {
-        return false;
-    }
-
-    // Running as real root doesn't need userns
-    if rustix::process::getuid().is_root() {
-        return false;
-    }
-
-    // Non-root user needs userns for proper UID/GID mapping
-    true
-}
-
-/// Re-execute this binary via `podman unshare` to enter a user namespace.
-///
-/// This function does not return on success - it replaces the current process.
-fn reexec_in_userns() -> Result<std::convert::Infallible> {
-    let exe = std::fs::read_link("/proc/self/exe").context("Failed to read /proc/self/exe")?;
-
-    let args: Vec<String> = std::env::args().collect();
-
-    // Use exec() to replace the current process
-    let err = Command::new("podman")
-        .arg("unshare")
-        .arg(&exe)
-        .args(&args[1..])
-        .env(USERNS_ENV, "1")
-        .exec();
-
-    // exec() only returns on error
-    Err(err).context("Failed to exec podman unshare")
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Re-exec via podman unshare if needed for proper UID/GID mapping
-    if needs_userns() {
-        reexec_in_userns()?;
+    if cstor_rs::userns::should_enter_userns(USERNS_ENV) {
+        cstor_rs::userns::reexec_via_podman(USERNS_ENV)
+            .map_err(|e| anyhow!("Failed to enter user namespace: {}", e))?;
     }
 
     // Open storage
@@ -263,9 +223,11 @@ fn main() -> Result<()> {
             } => reflink_to_dir(&storage, &image, output, force_copy, use_splitfdstream)?,
         },
         Commands::Layer { command } => match command {
-            LayerCommands::Inspect { layer, chain, format } => {
-                inspect_layer(&storage, &layer, chain, format)?
-            }
+            LayerCommands::Inspect {
+                layer,
+                chain,
+                format,
+            } => inspect_layer(&storage, &layer, chain, format)?,
             LayerCommands::Export { layer, output } => export_layer(&storage, &layer, output)?,
             LayerCommands::ExportIpc { layer, output } => {
                 export_layer_ipc(&storage, &layer, output)?
@@ -289,11 +251,17 @@ fn parse_repo_tag(name: &str) -> (String, String) {
         let after_slash = &name[last_slash + 1..];
         if let Some(colon_offset) = after_slash.rfind(':') {
             let colon_pos = last_slash + 1 + colon_offset;
-            return (name[..colon_pos].to_string(), name[colon_pos + 1..].to_string());
+            return (
+                name[..colon_pos].to_string(),
+                name[colon_pos + 1..].to_string(),
+            );
         }
     } else if let Some(colon_pos) = name.rfind(':') {
         // No slash, simple case like "alpine:latest"
-        return (name[..colon_pos].to_string(), name[colon_pos + 1..].to_string());
+        return (
+            name[..colon_pos].to_string(),
+            name[colon_pos + 1..].to_string(),
+        );
     }
     // No tag found
     (name.to_string(), "<none>".to_string())
@@ -414,7 +382,10 @@ fn open_layer_by_id_or_link(storage: &Storage, layer_ref: &str) -> Result<Layer>
             .context("Failed to open overlay directory")?;
 
         let mut matches: Vec<String> = Vec::new();
-        for entry in overlay_dir.entries().context("Failed to read overlay directory")? {
+        for entry in overlay_dir
+            .entries()
+            .context("Failed to read overlay directory")?
+        {
             let entry = entry.context("Failed to read directory entry")?;
             if entry.file_type()?.is_dir() {
                 let name = entry.file_name();
@@ -607,7 +578,9 @@ fn copy_to_oci(storage: &Storage, image_id: &str, output: PathBuf) -> Result<()>
     let image = open_image_by_id_or_name(storage, image_id)?;
 
     // Get storage layer IDs (resolved from diff_ids via layers.json)
-    let layer_ids = image.storage_layer_ids(storage).context("Failed to get layer IDs")?;
+    let layer_ids = image
+        .storage_layer_ids(storage)
+        .context("Failed to get layer IDs")?;
 
     // Create output directory structure
     std::fs::create_dir_all(&output).context("Failed to create output directory")?;
@@ -827,7 +800,9 @@ fn reflink_to_dir_splitfdstream(
     use cstor_rs::splitfdstream::extract_to_dir;
     use cstor_rs::{DEFAULT_INLINE_THRESHOLD, layer_to_splitfdstream};
 
-    let layer_ids = image.storage_layer_ids(storage).context("Failed to get layer IDs")?;
+    let layer_ids = image
+        .storage_layer_ids(storage)
+        .context("Failed to get layer IDs")?;
 
     eprintln!(
         "Extracting {} layers to {} (using splitfdstream)",

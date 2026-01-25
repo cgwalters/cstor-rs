@@ -101,6 +101,9 @@ pub mod generic_tree;
 pub mod proxy_v2;
 mod readatreader;
 
+// User namespace handling
+pub mod userns;
+
 // Re-export commonly used types
 pub use config::{AdditionalLayerStore, StorageConfig};
 pub use error::{Result, StorageError};
