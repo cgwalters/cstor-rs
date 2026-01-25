@@ -79,6 +79,7 @@ pub mod config;
 pub mod error;
 pub mod image;
 pub mod layer;
+pub mod lockfile;
 pub mod storage;
 
 // Tar handling
