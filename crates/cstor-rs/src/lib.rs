@@ -122,7 +122,10 @@ pub use error::{Result, StorageError};
 pub use generic_tree::{FileSystem, Inode, TreeError};
 pub use image::Image;
 pub use layer::Layer;
-pub use storage::{LayerMetadata, Storage};
+pub use lockfile::LastWrite;
+pub use storage::{
+    ImageLockGuard, ImageRLockGuard, LayerLockGuard, LayerMetadata, LayerRLockGuard, Storage,
+};
 pub use tar_split::{
     DEFAULT_INLINE_THRESHOLD, LayerSplitfdstream, TarHeader, TarSplitFdStream, TarSplitItem,
     layer_to_splitfdstream,

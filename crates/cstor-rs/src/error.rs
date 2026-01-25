@@ -101,4 +101,12 @@ pub enum StorageError {
     /// Tree operation error (e.g., invalid path).
     #[error("tree error: {0}")]
     Tree(#[from] TreeError),
+
+    /// Attempted write operation on read-only storage.
+    #[error("storage is read-only")]
+    ReadOnly,
+
+    /// Lock file operation failed.
+    #[error("lock error: {0}")]
+    Lock(#[from] crate::lockfile::LockError),
 }

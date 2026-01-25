@@ -56,6 +56,7 @@
 //! the exact file descriptor we opened, not a path that could be replaced.
 
 use crate::error::{Result, StorageError};
+use crate::lockfile::{LastWrite, LockFile, LockGuard, RLockGuard};
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use rusqlite::Connection;
@@ -63,14 +64,35 @@ use rustix::path::DecInt;
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// Main storage handle providing read-only access to container storage.
+/// Main storage handle providing access to container storage.
 ///
 /// The Storage struct holds:
 /// - A `Dir` handle to the storage root for fd-relative file operations
 /// - A SQLite database connection for metadata access
+/// - Optional lock files for coordinating access with other processes
 ///
 /// All file access is performed relative to the `Dir` handle, ensuring that
 /// operations cannot escape the storage directory hierarchy.
+///
+/// # Read-Only vs Read-Write Mode
+///
+/// Storage can be opened in read-only mode (the default) or read-write mode:
+///
+/// ```no_run
+/// use cstor_rs::Storage;
+///
+/// // Read-only access (default)
+/// let ro_storage = Storage::open("/var/lib/containers/storage")?;
+/// assert!(!ro_storage.is_writable());
+///
+/// // Read-write access with locking
+/// let rw_storage = Storage::open_writable("/var/lib/containers/storage")?;
+/// assert!(rw_storage.is_writable());
+/// # Ok::<(), cstor_rs::StorageError>(())
+/// ```
+///
+/// When opened in read-write mode, the storage acquires lock files that coordinate
+/// access with other processes (including the Go-based containers/storage).
 #[derive(Debug)]
 pub struct Storage {
     /// Directory handle for the storage root, used for all fd-relative operations.
@@ -78,6 +100,17 @@ pub struct Storage {
 
     /// SQLite database connection for metadata queries.
     db: Connection,
+
+    /// Lock file for layer operations (overlay-layers/layers.lock).
+    /// Present when opened in read-write mode.
+    layers_lock: Option<LockFile>,
+
+    /// Lock file for image operations (overlay-images/images.lock).
+    /// Present when opened in read-write mode.
+    images_lock: Option<LockFile>,
+
+    /// Whether this storage is in read-only mode.
+    read_only: bool,
 }
 
 impl Storage {
@@ -123,7 +156,13 @@ impl Storage {
         // Open database via fd-relative path
         let db = Self::open_database(&root_dir)?;
 
-        Ok(Self { root_dir, db })
+        Ok(Self {
+            root_dir,
+            db,
+            layers_lock: None,
+            images_lock: None,
+            read_only: true,
+        })
     }
 
     /// Discover storage root from default locations.
@@ -162,6 +201,112 @@ impl Storage {
         Err(StorageError::InvalidStorage(
             "No valid storage location found. Searched default locations.".to_string(),
         ))
+    }
+
+    /// Open storage at the given root path in read-write mode.
+    ///
+    /// This opens the storage with write access and creates lock files for
+    /// coordinating access with other processes. The lock files follow the
+    /// containers/storage convention:
+    /// - `overlay-layers/layers.lock` - protects layer operations
+    /// - `overlay-images/images.lock` - protects image operations
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - Path to the storage root directory
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path does not exist or is not a directory
+    /// - Required subdirectories are missing
+    /// - The database file is missing or invalid
+    /// - Lock files cannot be created or opened
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::Storage;
+    ///
+    /// let storage = Storage::open_writable("/var/lib/containers/storage")?;
+    /// assert!(storage.is_writable());
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn open_writable<P: AsRef<Path>>(root: P) -> Result<Self> {
+        let root_path = root.as_ref();
+
+        // Open the directory handle for fd-relative operations
+        let root_dir = Dir::open_ambient_dir(root_path, ambient_authority()).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::RootNotFound(root_path.to_path_buf())
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+
+        // Validate storage structure
+        Self::validate_storage(&root_dir)?;
+
+        // Open database via fd-relative path
+        let db = Self::open_database(&root_dir)?;
+
+        // Create lock files for layers and images
+        let layers_lock_path = root_path.join("overlay-layers/layers.lock");
+        let images_lock_path = root_path.join("overlay-images/images.lock");
+
+        let layers_lock = LockFile::open(&layers_lock_path, false)?;
+        let images_lock = LockFile::open(&images_lock_path, false)?;
+
+        Ok(Self {
+            root_dir,
+            db,
+            layers_lock: Some(layers_lock),
+            images_lock: Some(images_lock),
+            read_only: false,
+        })
+    }
+
+    /// Discover storage root from default locations and open in read-write mode.
+    ///
+    /// This is the read-write equivalent of [`discover()`](Self::discover).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no valid storage location is found or if the storage
+    /// cannot be opened for writing.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::Storage;
+    ///
+    /// let storage = Storage::discover_writable()?;
+    /// assert!(storage.is_writable());
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn discover_writable() -> Result<Self> {
+        let search_paths = Self::default_search_paths();
+
+        for path in search_paths {
+            if path.exists() {
+                match Self::open_writable(&path) {
+                    Ok(storage) => return Ok(storage),
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        Err(StorageError::InvalidStorage(
+            "No valid storage location found. Searched default locations.".to_string(),
+        ))
+    }
+
+    /// Check if this storage is writable.
+    ///
+    /// Returns `true` if the storage was opened with [`open_writable()`](Self::open_writable)
+    /// or [`discover_writable()`](Self::discover_writable), `false` otherwise.
+    pub fn is_writable(&self) -> bool {
+        !self.read_only
     }
 
     /// Get the default search paths for storage discovery.
@@ -275,7 +420,13 @@ impl Storage {
     pub fn from_root_dir(root_dir: Dir) -> Result<Self> {
         Self::validate_storage(&root_dir)?;
         let db = Self::open_database(&root_dir)?;
-        Ok(Self { root_dir, db })
+        Ok(Self {
+            root_dir,
+            db,
+            layers_lock: None,
+            images_lock: None,
+            read_only: true,
+        })
     }
 
     /// Get a reference to the root directory handle.
@@ -290,6 +441,239 @@ impl Storage {
     /// This provides access to the underlying SQLite connection for metadata queries.
     pub fn database(&self) -> &Connection {
         &self.db
+    }
+
+    // ========== Locking Methods ==========
+
+    /// Acquire an exclusive lock on the layers store.
+    ///
+    /// This lock must be held when modifying layer data. The returned guard
+    /// releases the lock when dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadOnly`] if the storage was opened in read-only mode.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::Storage;
+    ///
+    /// let storage = Storage::open_writable("/var/lib/containers/storage")?;
+    /// let guard = storage.lock_layers()?;
+    /// // Perform layer modifications...
+    /// drop(guard); // Lock released
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn lock_layers(&self) -> Result<LayerLockGuard<'_>> {
+        let lock = self.layers_lock.as_ref().ok_or(StorageError::ReadOnly)?;
+        let guard = lock.lock();
+        Ok(LayerLockGuard {
+            storage: self,
+            _lock: guard,
+        })
+    }
+
+    /// Acquire an exclusive lock on the images store.
+    ///
+    /// This lock must be held when modifying image data. The returned guard
+    /// releases the lock when dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadOnly`] if the storage was opened in read-only mode.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::Storage;
+    ///
+    /// let storage = Storage::open_writable("/var/lib/containers/storage")?;
+    /// let guard = storage.lock_images()?;
+    /// // Perform image modifications...
+    /// drop(guard); // Lock released
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn lock_images(&self) -> Result<ImageLockGuard<'_>> {
+        let lock = self.images_lock.as_ref().ok_or(StorageError::ReadOnly)?;
+        let guard = lock.lock();
+        Ok(ImageLockGuard {
+            storage: self,
+            _lock: guard,
+        })
+    }
+
+    /// Acquire a shared (read) lock on the layers store.
+    ///
+    /// This lock allows concurrent readers but blocks writers. Use this when
+    /// reading layer data to ensure consistency.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadOnly`] if the storage was opened in read-only mode
+    /// (read locks require the lock file to be opened).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::Storage;
+    ///
+    /// let storage = Storage::open_writable("/var/lib/containers/storage")?;
+    /// let guard = storage.rlock_layers()?;
+    /// // Read layer data with consistency guarantee...
+    /// drop(guard);
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn rlock_layers(&self) -> Result<LayerRLockGuard<'_>> {
+        let lock = self.layers_lock.as_ref().ok_or(StorageError::ReadOnly)?;
+        let guard = lock.rlock();
+        Ok(LayerRLockGuard {
+            storage: self,
+            _lock: guard,
+        })
+    }
+
+    /// Acquire a shared (read) lock on the images store.
+    ///
+    /// This lock allows concurrent readers but blocks writers. Use this when
+    /// reading image data to ensure consistency.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadOnly`] if the storage was opened in read-only mode
+    /// (read locks require the lock file to be opened).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::Storage;
+    ///
+    /// let storage = Storage::open_writable("/var/lib/containers/storage")?;
+    /// let guard = storage.rlock_images()?;
+    /// // Read image data with consistency guarantee...
+    /// drop(guard);
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn rlock_images(&self) -> Result<ImageRLockGuard<'_>> {
+        let lock = self.images_lock.as_ref().ok_or(StorageError::ReadOnly)?;
+        let guard = lock.rlock();
+        Ok(ImageRLockGuard {
+            storage: self,
+            _lock: guard,
+        })
+    }
+
+    // ========== Change Detection Methods ==========
+
+    /// Check if the layers store was modified since the given token.
+    ///
+    /// This reads the current "last write" token from the layers lock file
+    /// and compares it to the provided token. Returns `true` if they differ,
+    /// indicating another process has modified the layer data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadOnly`] if the storage was opened in read-only mode.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::Storage;
+    ///
+    /// let storage = Storage::open_writable("/var/lib/containers/storage")?;
+    ///
+    /// // Get initial state
+    /// let token = storage.get_layers_last_write()?;
+    ///
+    /// // Later, check if anything changed
+    /// if storage.layers_modified_since(&token)? {
+    ///     println!("Layers were modified by another process");
+    /// }
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn layers_modified_since(&self, token: &LastWrite) -> Result<bool> {
+        let lock = self.layers_lock.as_ref().ok_or(StorageError::ReadOnly)?;
+        Ok(lock.modified_since(token)?)
+    }
+
+    /// Check if the images store was modified since the given token.
+    ///
+    /// This reads the current "last write" token from the images lock file
+    /// and compares it to the provided token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadOnly`] if the storage was opened in read-only mode.
+    pub fn images_modified_since(&self, token: &LastWrite) -> Result<bool> {
+        let lock = self.images_lock.as_ref().ok_or(StorageError::ReadOnly)?;
+        Ok(lock.modified_since(token)?)
+    }
+
+    /// Get the current "last write" token for the layers store.
+    ///
+    /// This token can be saved and later used with [`layers_modified_since()`](Self::layers_modified_since)
+    /// to detect if any modifications occurred.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadOnly`] if the storage was opened in read-only mode.
+    pub fn get_layers_last_write(&self) -> Result<LastWrite> {
+        let lock = self.layers_lock.as_ref().ok_or(StorageError::ReadOnly)?;
+        Ok(lock.get_last_write()?)
+    }
+
+    /// Get the current "last write" token for the images store.
+    ///
+    /// This token can be saved and later used with [`images_modified_since()`](Self::images_modified_since)
+    /// to detect if any modifications occurred.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadOnly`] if the storage was opened in read-only mode.
+    pub fn get_images_last_write(&self) -> Result<LastWrite> {
+        let lock = self.images_lock.as_ref().ok_or(StorageError::ReadOnly)?;
+        Ok(lock.get_last_write()?)
+    }
+
+    /// Record a write operation to the layers store.
+    ///
+    /// This should be called while holding an exclusive layers lock. It updates
+    /// the lock file with a new token that allows other processes to detect
+    /// that a modification occurred.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadOnly`] if the storage was opened in read-only mode.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::Storage;
+    ///
+    /// let storage = Storage::open_writable("/var/lib/containers/storage")?;
+    /// let _guard = storage.lock_layers()?;
+    ///
+    /// // Perform layer modifications...
+    ///
+    /// // Record that we made changes
+    /// let token = storage.record_layers_write()?;
+    /// # Ok::<(), cstor_rs::StorageError>(())
+    /// ```
+    pub fn record_layers_write(&self) -> Result<LastWrite> {
+        let lock = self.layers_lock.as_ref().ok_or(StorageError::ReadOnly)?;
+        Ok(lock.record_write()?)
+    }
+
+    /// Record a write operation to the images store.
+    ///
+    /// This should be called while holding an exclusive images lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadOnly`] if the storage was opened in read-only mode.
+    pub fn record_images_write(&self) -> Result<LastWrite> {
+        let lock = self.images_lock.as_ref().ok_or(StorageError::ReadOnly)?;
+        Ok(lock.record_write()?)
     }
 
     /// Resolve a link ID to a layer ID using fd-relative symlink reading.
@@ -655,6 +1039,114 @@ pub struct LayerMetadata {
     pub compressed_size: Option<u64>,
 }
 
+// ========== Lock Guard Types ==========
+
+/// RAII guard for an exclusive lock on the layers store.
+///
+/// This guard is returned by [`Storage::lock_layers()`] and provides exclusive
+/// access to layer data. The lock is automatically released when the guard is dropped.
+///
+/// # Example
+///
+/// ```no_run
+/// use cstor_rs::Storage;
+///
+/// let storage = Storage::open_writable("/var/lib/containers/storage")?;
+///
+/// {
+///     let guard = storage.lock_layers()?;
+///     // Exclusive access to layers...
+/// } // Lock released here
+/// # Ok::<(), cstor_rs::StorageError>(())
+/// ```
+#[derive(Debug)]
+pub struct LayerLockGuard<'a> {
+    /// Reference to the storage that owns the lock.
+    storage: &'a Storage,
+    /// The underlying lock guard from the lockfile module.
+    _lock: LockGuard<'a>,
+}
+
+impl<'a> LayerLockGuard<'a> {
+    /// Get a reference to the storage.
+    pub fn storage(&self) -> &Storage {
+        self.storage
+    }
+}
+
+/// RAII guard for a shared (read) lock on the layers store.
+///
+/// This guard is returned by [`Storage::rlock_layers()`] and provides shared
+/// read access to layer data. Multiple readers can hold this lock simultaneously,
+/// but writers are blocked.
+#[derive(Debug)]
+pub struct LayerRLockGuard<'a> {
+    /// Reference to the storage that owns the lock.
+    storage: &'a Storage,
+    /// The underlying read lock guard from the lockfile module.
+    _lock: RLockGuard<'a>,
+}
+
+impl<'a> LayerRLockGuard<'a> {
+    /// Get a reference to the storage.
+    pub fn storage(&self) -> &Storage {
+        self.storage
+    }
+}
+
+/// RAII guard for an exclusive lock on the images store.
+///
+/// This guard is returned by [`Storage::lock_images()`] and provides exclusive
+/// access to image data. The lock is automatically released when the guard is dropped.
+///
+/// # Example
+///
+/// ```no_run
+/// use cstor_rs::Storage;
+///
+/// let storage = Storage::open_writable("/var/lib/containers/storage")?;
+///
+/// {
+///     let guard = storage.lock_images()?;
+///     // Exclusive access to images...
+/// } // Lock released here
+/// # Ok::<(), cstor_rs::StorageError>(())
+/// ```
+#[derive(Debug)]
+pub struct ImageLockGuard<'a> {
+    /// Reference to the storage that owns the lock.
+    storage: &'a Storage,
+    /// The underlying lock guard from the lockfile module.
+    _lock: LockGuard<'a>,
+}
+
+impl<'a> ImageLockGuard<'a> {
+    /// Get a reference to the storage.
+    pub fn storage(&self) -> &Storage {
+        self.storage
+    }
+}
+
+/// RAII guard for a shared (read) lock on the images store.
+///
+/// This guard is returned by [`Storage::rlock_images()`] and provides shared
+/// read access to image data. Multiple readers can hold this lock simultaneously,
+/// but writers are blocked.
+#[derive(Debug)]
+pub struct ImageRLockGuard<'a> {
+    /// Reference to the storage that owns the lock.
+    storage: &'a Storage,
+    /// The underlying read lock guard from the lockfile module.
+    _lock: RLockGuard<'a>,
+}
+
+impl<'a> ImageRLockGuard<'a> {
+    /// Get a reference to the storage.
+    pub fn storage(&self) -> &Storage {
+        self.storage
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,5 +1165,118 @@ mod tests {
         if result.is_ok() {
             println!("Found storage at default location");
         }
+    }
+
+    #[test]
+    fn test_read_only_storage_is_not_writable() {
+        // Create a mock storage directory structure for testing
+        let dir = tempfile::tempdir().unwrap();
+        let storage_path = dir.path();
+
+        // Create required directories and files
+        std::fs::create_dir_all(storage_path.join("overlay")).unwrap();
+        std::fs::create_dir_all(storage_path.join("overlay-layers")).unwrap();
+        std::fs::create_dir_all(storage_path.join("overlay-images")).unwrap();
+
+        // Create an empty db.sql file
+        std::fs::write(storage_path.join("db.sql"), "").unwrap();
+
+        let storage = Storage::open(storage_path).unwrap();
+        assert!(!storage.is_writable());
+
+        // Lock operations should fail on read-only storage
+        assert!(matches!(storage.lock_layers(), Err(StorageError::ReadOnly)));
+        assert!(matches!(storage.lock_images(), Err(StorageError::ReadOnly)));
+        assert!(matches!(
+            storage.rlock_layers(),
+            Err(StorageError::ReadOnly)
+        ));
+        assert!(matches!(
+            storage.rlock_images(),
+            Err(StorageError::ReadOnly)
+        ));
+    }
+
+    #[test]
+    fn test_writable_storage_locking() {
+        // Create a mock storage directory structure for testing
+        let dir = tempfile::tempdir().unwrap();
+        let storage_path = dir.path();
+
+        // Create required directories and files
+        std::fs::create_dir_all(storage_path.join("overlay")).unwrap();
+        std::fs::create_dir_all(storage_path.join("overlay-layers")).unwrap();
+        std::fs::create_dir_all(storage_path.join("overlay-images")).unwrap();
+
+        // Create an empty db.sql file
+        std::fs::write(storage_path.join("db.sql"), "").unwrap();
+
+        let storage = Storage::open_writable(storage_path).unwrap();
+        assert!(storage.is_writable());
+
+        // Exclusive layer lock
+        {
+            let guard = storage.lock_layers().unwrap();
+            assert!(std::ptr::eq(guard.storage(), &storage));
+        }
+
+        // Exclusive image lock
+        {
+            let guard = storage.lock_images().unwrap();
+            assert!(std::ptr::eq(guard.storage(), &storage));
+        }
+
+        // Shared layer lock
+        {
+            let guard = storage.rlock_layers().unwrap();
+            assert!(std::ptr::eq(guard.storage(), &storage));
+        }
+
+        // Shared image lock
+        {
+            let guard = storage.rlock_images().unwrap();
+            assert!(std::ptr::eq(guard.storage(), &storage));
+        }
+    }
+
+    #[test]
+    fn test_change_detection() {
+        // Create a mock storage directory structure for testing
+        let dir = tempfile::tempdir().unwrap();
+        let storage_path = dir.path();
+
+        // Create required directories and files
+        std::fs::create_dir_all(storage_path.join("overlay")).unwrap();
+        std::fs::create_dir_all(storage_path.join("overlay-layers")).unwrap();
+        std::fs::create_dir_all(storage_path.join("overlay-images")).unwrap();
+
+        // Create an empty db.sql file
+        std::fs::write(storage_path.join("db.sql"), "").unwrap();
+
+        let storage = Storage::open_writable(storage_path).unwrap();
+
+        // Get initial token (should be empty/default)
+        let token1 = storage.get_layers_last_write().unwrap();
+        assert!(token1.is_empty());
+
+        // Acquire lock and record a write
+        let _guard = storage.lock_layers().unwrap();
+        let token2 = storage.record_layers_write().unwrap();
+        drop(_guard);
+
+        // Should not be modified since token2
+        assert!(!storage.layers_modified_since(&token2).unwrap());
+
+        // Should be modified since token1
+        assert!(storage.layers_modified_since(&token1).unwrap());
+
+        // Record another write
+        let _guard = storage.lock_layers().unwrap();
+        let token3 = storage.record_layers_write().unwrap();
+        drop(_guard);
+
+        // token2 should now show modification
+        assert!(storage.layers_modified_since(&token2).unwrap());
+        assert!(!storage.layers_modified_since(&token3).unwrap());
     }
 }
