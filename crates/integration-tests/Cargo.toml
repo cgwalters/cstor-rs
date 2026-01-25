@@ -23,6 +23,8 @@ uuid.workspace = true
 cap-std.workspace = true
 rustix.workspace = true
 rusqlite.workspace = true
+flate2.workspace = true
+serde_json.workspace = true
 
 [lints.rust]
 # linkme requires unsafe
