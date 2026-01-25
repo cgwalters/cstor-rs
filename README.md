@@ -129,34 +129,37 @@ Main CLI tool exposing all library functionality. Automatically handles rootless
 
 ```bash
 # List all images in storage
-cstor-rs list-images --verbose
+cstor-rs image list
 
-# Show image details
-cstor-rs inspect-image <image-id> --layers
+# Show image details with layers
+cstor-rs image inspect <image-id>
 
 # List layers for an image
-cstor-rs list-layers <image-id>
-
-# Inspect layer details
-cstor-rs inspect-layer <layer-id> --chain
-
-# Export a layer as tar stream (uses tar-split for reconstruction)
-cstor-rs export-layer <layer-id> -o layer.tar
-
-# Copy image to OCI directory layout
-cstor-rs copy-to-oci <image-id> /path/to/oci-dir
-
-# Extract image to directory using reflinks (zero-copy on btrfs/XFS)
-cstor-rs reflink-to-dir <image-id> /path/to/output-dir [--force-copy]
+cstor-rs image layers <image-id>
 
 # Generate Table of Contents (TOC) as JSON
-cstor-rs toc <image-id> --pretty
+cstor-rs image toc <image-id> --pretty
+
+# Copy image to OCI directory layout
+cstor-rs image copy-to-oci <image-id> /path/to/oci-dir
+
+# Extract image to directory using reflinks (zero-copy on btrfs/XFS)
+cstor-rs image extract <image-id> /path/to/output-dir [--no-reflinks]
+
+# Inspect layer details
+cstor-rs layer inspect <layer-id>
+
+# Export a layer as tar stream (uses tar-split for reconstruction)
+cstor-rs layer export <layer-id> -o layer.tar
+
+# Extract a single layer to directory
+cstor-rs layer extract <layer-id> /path/to/output-dir
 
 # Resolve a link ID to layer ID
 cstor-rs resolve-link <link-id>
 ```
 
-The CLI automatically re-executes via `podman unshare` when running as non-root for commands that need file access (export-layer, copy-to-oci, reflink-to-dir), ensuring correct UID/GID mappings.
+The CLI automatically handles rootless mode using the ProxiedStorage API, which spawns a helper process via `podman unshare` for file access when needed.
 
 ### tar-diff
 
@@ -171,7 +174,61 @@ The tool reports missing entries, extra entries, and metadata/content difference
 
 ## Library Usage
 
-The CLI serves as a demonstration of using this library from Rust for nontrivial use cases. For API examples and documentation, see the module-level documentation via `cargo doc --open`. The CLI source code in `src/bin/cstor-rs.rs` provides practical examples of all major library features.
+The CLI serves as a demonstration of using this library from Rust for nontrivial use cases. For API examples and documentation, see the module-level documentation via `cargo doc --open`.
+
+### Basic Usage
+
+```rust
+use cstor_rs::{Storage, Layer};
+
+// Discover storage from default locations
+let storage = Storage::discover()?;
+
+// Or open at a specific path
+let storage = Storage::open("/var/lib/containers/storage")?;
+
+// List images
+for image in storage.list_images()? {
+    println!("{}: {:?}", image.id(), image.names());
+}
+
+// Open and inspect a layer
+let layer = Layer::open(&storage, "layer-id")?;
+println!("Layer size: {}", layer.diff_size());
+```
+
+### Unprivileged Access with ProxiedStorage
+
+For applications needing to access file content from an unprivileged process with rootless Podman:
+
+```rust
+use cstor_rs::{ProxiedStorage, init_if_helper};
+
+fn main() {
+    // Required: call early in main() for userns helper support
+    init_if_helper();
+    
+    // Rest of application...
+}
+
+async fn extract_image() -> Result<(), Box<dyn std::error::Error>> {
+    // Automatically uses IPC proxy if running unprivileged
+    let mut storage = ProxiedStorage::open_with_proxy("/path/to/storage").await?;
+    
+    if storage.is_proxied() {
+        println!("Using userns helper for privileged access");
+    }
+    
+    // Operations work transparently in both modes
+    for image in storage.list_images()? {
+        println!("{}", image.id);
+    }
+    
+    Ok(())
+}
+```
+
+The helper spawns a process via `podman unshare` that can read any file in the user namespace, passing file descriptors back via SCM_RIGHTS for reflink extraction.
 
 ## Prerequisites
 
@@ -203,12 +260,15 @@ Key modules:
 - `layer`: Layer hierarchy, chain resolution, and file access
 - `tar_split`: tar-split format parsing and TarSplitFdStream
 - `splitfdstream`: Binary format for tar streams with external fd references
+- `extract`: Layer/image extraction with reflink support
 - `tar_writer`: TAR header writing utilities
 - `toc`: Table of Contents generation with whiteout support
 - `server`: JSON-RPC server for streaming layers with fd passing
 - `client`: JSON-RPC client for receiving layer streams
 - `protocol`: Wire format definitions for IPC
 - `proxy_v2`: Client for skopeo v2 protocol with JSON-RPC fd passing
+- `userns_helper`: User namespace IPC helper for unprivileged access
+- `userns`: User namespace detection and re-exec utilities
 - `generic_tree`: Secure path-validated filesystem tree
 - `config`: storage.conf parsing
 - `error`: Error types and handling
