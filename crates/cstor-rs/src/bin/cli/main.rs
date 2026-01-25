@@ -31,7 +31,7 @@ mod table;
 
 use anyhow::{Context, Result, anyhow};
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, Permissions};
+use cap_std::fs::Dir;
 use clap::{Parser, Subcommand};
 use cstor_rs::*;
 use output::{
@@ -41,8 +41,7 @@ use output::{
 use sha2::Digest;
 use std::fs::File;
 use std::io::{self, Write};
-use std::ops::Deref;
-use std::os::unix::fs::PermissionsExt;
+
 use std::path::PathBuf;
 
 /// Environment variable set when we've re-execed into a user namespace
@@ -141,17 +140,23 @@ enum ImageCommands {
     /// Flattens all layers and extracts to the destination directory.
     /// Files are reflinked from the source storage when possible,
     /// avoiding data duplication on filesystems that support it (btrfs, XFS).
+    ///
+    /// Uses ProxiedStorage for transparent access even when running
+    /// as an unprivileged user with rootless Podman.
     Extract {
         /// Image ID or name
         image: String,
         /// Destination directory (must not exist)
         output: PathBuf,
-        /// Fall back to copying if reflinks are not supported
+        /// Disable reflinks and always copy file data
         #[arg(long)]
-        force_copy: bool,
-        /// Use splitfdstream path for extraction (experimental)
+        no_reflinks: bool,
+        /// Preserve file ownership (UID/GID) - requires privileges
         #[arg(long)]
-        use_splitfdstream: bool,
+        preserve_ownership: bool,
+        /// Disable preserving file permissions
+        #[arg(long)]
+        no_permissions: bool,
     },
 }
 
@@ -190,6 +195,30 @@ enum LayerCommands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Extract layer to directory using reflinks
+    ///
+    /// Extracts all files from the layer to the destination directory.
+    /// Files are reflinked from the source storage when possible,
+    /// avoiding data duplication on filesystems that support it (btrfs, XFS).
+    ///
+    /// Uses ProxiedStorage for transparent access even when running
+    /// as an unprivileged user with rootless Podman.
+    Extract {
+        /// Layer ID
+        layer: String,
+        /// Destination directory (must not exist)
+        output: PathBuf,
+        /// Disable reflinks and always copy file data
+        #[arg(long)]
+        no_reflinks: bool,
+        /// Preserve file ownership (UID/GID) - requires privileges
+        #[arg(long)]
+        preserve_ownership: bool,
+        /// Disable preserving file permissions
+        #[arg(long)]
+        no_permissions: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -222,9 +251,17 @@ fn main() -> Result<()> {
             ImageCommands::Extract {
                 image,
                 output,
-                force_copy,
-                use_splitfdstream,
-            } => reflink_to_dir(&storage, &image, output, force_copy, use_splitfdstream)?,
+                no_reflinks,
+                preserve_ownership,
+                no_permissions,
+            } => extract_image_cmd(
+                &cli.root,
+                &image,
+                output,
+                no_reflinks,
+                preserve_ownership,
+                no_permissions,
+            )?,
         },
         Commands::Layer { command } => match command {
             LayerCommands::Inspect {
@@ -236,6 +273,20 @@ fn main() -> Result<()> {
             LayerCommands::ExportIpc { layer, output } => {
                 export_layer_ipc(&storage, &layer, output)?
             }
+            LayerCommands::Extract {
+                layer,
+                output,
+                no_reflinks,
+                preserve_ownership,
+                no_permissions,
+            } => extract_layer_cmd(
+                &cli.root,
+                &layer,
+                output,
+                no_reflinks,
+                preserve_ownership,
+                no_permissions,
+            )?,
         },
         Commands::ResolveLink { link_id } => resolve_link(&storage, &link_id)?,
     }
@@ -717,288 +768,6 @@ fn resolve_link(storage: &Storage, link_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn reflink_to_dir(
-    storage: &Storage,
-    image_id: &str,
-    dest: PathBuf,
-    force_copy: bool,
-    use_splitfdstream: bool,
-) -> Result<()> {
-    let image = open_image_by_id_or_name(storage, image_id)?;
-
-    // Require parent directory to exist, but destination must not exist
-    if dest.exists() {
-        anyhow::bail!("Destination directory already exists: {}", dest.display());
-    }
-    let parent = dest.parent().context("Destination path has no parent")?;
-    if !parent.exists() {
-        anyhow::bail!("Parent directory does not exist: {}", parent.display());
-    }
-
-    // Create destination directory and open as Dir
-    std::fs::create_dir(&dest).context("Failed to create destination directory")?;
-    let dest_dir = Dir::open_ambient_dir(&dest, ambient_authority())
-        .context("Failed to open destination directory")?;
-
-    if use_splitfdstream {
-        reflink_to_dir_splitfdstream(storage, &image, &dest_dir, &dest, force_copy)
-    } else {
-        reflink_to_dir_toc(storage, &image, &dest_dir, &dest, force_copy)
-    }
-}
-
-/// Extract image using TOC-based approach (original implementation).
-fn reflink_to_dir_toc(
-    storage: &Storage,
-    image: &cstor_rs::Image,
-    dest_dir: &Dir,
-    dest: &std::path::Path,
-    force_copy: bool,
-) -> Result<()> {
-    use cstor_rs::Toc;
-    use std::collections::HashMap;
-
-    // Build merged TOC with layer mapping
-    // This properly handles whiteouts - files deleted in upper layers won't appear
-    let (toc, layer_map) =
-        Toc::from_image_with_layers(storage, image).context("Failed to build merged TOC")?;
-
-    eprintln!(
-        "Extracting {} entries to {}",
-        toc.entries.len(),
-        dest.display()
-    );
-
-    // Cache opened layers to avoid reopening
-    let mut layer_cache: HashMap<String, Layer> = HashMap::new();
-
-    // Extract each entry from its source layer
-    for entry in &toc.entries {
-        let layer_id = layer_map
-            .get(&entry.name)
-            .with_context(|| format!("No layer mapping for entry: {}", entry.name.display()))?;
-
-        // Get or open the layer (using entry API for efficiency)
-        if !layer_cache.contains_key(layer_id) {
-            let layer = Layer::open(storage, layer_id)
-                .with_context(|| format!("Failed to open layer {}", layer_id))?;
-            layer_cache.insert(layer_id.clone(), layer);
-        }
-        let layer = layer_cache.get(layer_id).unwrap();
-
-        extract_toc_entry(dest_dir, layer, entry, force_copy)?;
-    }
-
-    eprintln!("Successfully extracted image to {}", dest.display());
-    Ok(())
-}
-
-/// Extract image using splitfdstream approach.
-fn reflink_to_dir_splitfdstream(
-    storage: &Storage,
-    image: &cstor_rs::Image,
-    dest_dir: &Dir,
-    dest: &std::path::Path,
-    force_copy: bool,
-) -> Result<()> {
-    use cstor_rs::splitfdstream::extract_to_dir;
-    use cstor_rs::{DEFAULT_INLINE_THRESHOLD, layer_to_splitfdstream};
-
-    let layer_ids = image
-        .storage_layer_ids(storage)
-        .context("Failed to get layer IDs")?;
-
-    eprintln!(
-        "Extracting {} layers to {} (using splitfdstream)",
-        layer_ids.len(),
-        dest.display()
-    );
-
-    let mut total_stats = cstor_rs::splitfdstream::ExtractionStats::default();
-
-    // Process each layer in order (base to top)
-    // Process each layer in order (base to top), with later layers overwriting
-    // earlier ones. Whiteout files are processed for proper overlay semantics:
-    // - Regular whiteouts (.wh.<name>) remove the target file/directory
-    // - Opaque whiteouts (.wh..wh..opq) clear all contents from the directory
-    for (i, layer_id) in layer_ids.iter().enumerate() {
-        eprintln!(
-            "[{}/{}] Processing layer: {}",
-            i + 1,
-            layer_ids.len(),
-            layer_id
-        );
-
-        let layer = Layer::open(storage, layer_id)
-            .with_context(|| format!("Failed to open layer {}", layer_id))?;
-
-        // Convert layer to splitfdstream
-        let splitfd = layer_to_splitfdstream(storage, &layer, DEFAULT_INLINE_THRESHOLD)
-            .with_context(|| format!("Failed to convert layer {} to splitfdstream", layer_id))?;
-
-        // Extract from splitfdstream
-        let stats = extract_to_dir(
-            splitfd.stream.as_slice(),
-            &splitfd.files,
-            dest_dir,
-            force_copy,
-        )
-        .with_context(|| format!("Failed to extract layer {}", layer_id))?;
-
-        eprintln!(
-            "  {} files, {} dirs, {} symlinks, {} whiteouts, {} bytes reflinked, {} bytes copied, {} bytes inline",
-            stats.files_extracted,
-            stats.directories_created,
-            stats.symlinks_created,
-            stats.whiteouts_processed,
-            stats.bytes_reflinked,
-            stats.bytes_copied,
-            stats.bytes_inline
-        );
-
-        // Accumulate stats
-        total_stats.files_extracted += stats.files_extracted;
-        total_stats.directories_created += stats.directories_created;
-        total_stats.symlinks_created += stats.symlinks_created;
-        total_stats.hardlinks_created += stats.hardlinks_created;
-        total_stats.whiteouts_processed += stats.whiteouts_processed;
-        total_stats.bytes_reflinked += stats.bytes_reflinked;
-        total_stats.bytes_copied += stats.bytes_copied;
-        total_stats.bytes_inline += stats.bytes_inline;
-    }
-
-    eprintln!(
-        "Successfully extracted image to {} ({} files, {} dirs, {} bytes reflinked, {} bytes copied)",
-        dest.display(),
-        total_stats.files_extracted,
-        total_stats.directories_created,
-        total_stats.bytes_reflinked,
-        total_stats.bytes_copied
-    );
-
-    Ok(())
-}
-
-enum ParentDir<'a> {
-    Owned(Dir),
-    Ref(&'a Dir),
-}
-
-impl<'a> Deref for ParentDir<'a> {
-    type Target = Dir;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            ParentDir::Owned(dir) => dir,
-            ParentDir::Ref(dir) => dir,
-        }
-    }
-}
-
-/// Extract a single TOC entry to the destination directory.
-fn extract_toc_entry(
-    dest: &Dir,
-    layer: &Layer,
-    entry: &cstor_rs::TocEntry,
-    force_copy: bool,
-) -> Result<()> {
-    use cstor_rs::TocEntryType;
-    use rustix::fs::ioctl_ficlone;
-
-    let path = &entry.name;
-
-    // Skip empty paths
-    if path.as_os_str().is_empty() {
-        return Ok(());
-    }
-
-    // Create parent directories if needed
-    let parent = if let Some(parent_path) = path.parent().filter(|v| !v.as_os_str().is_empty()) {
-        dest.create_dir_all(parent_path)
-            .with_context(|| format!("Failed to create parent directory {:?}", parent_path))?;
-        ParentDir::Owned(
-            dest.open_dir(parent_path)
-                .with_context(|| format!("Failed to open parent directory {:?}", parent_path))?,
-        )
-    } else {
-        ParentDir::Ref(dest)
-    };
-
-    let Some(filename) = path.file_name() else {
-        return Ok(()); // Skip entries with no filename component
-    };
-
-    match entry.entry_type {
-        TocEntryType::Dir => {
-            match parent.create_dir(filename) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("Failed to create directory {:?}", path))?;
-                }
-            }
-            let std_perms = std::fs::Permissions::from_mode(entry.mode);
-            let perms = Permissions::from_std(std_perms);
-            parent
-                .set_permissions(filename, perms)
-                .with_context(|| format!("Failed to set permissions for {:?}", path))?;
-        }
-        TocEntryType::Symlink => {
-            let link_target = entry.link_name.as_deref().unwrap_or("");
-            let _ = parent.remove_file(filename);
-            parent
-                .symlink(link_target, filename)
-                .with_context(|| format!("Failed to create symlink {:?}", path))?;
-        }
-        TocEntryType::Reg => {
-            let _ = parent.remove_file(filename);
-            let dst_file = parent
-                .create(filename)
-                .with_context(|| format!("Failed to create file {:?}", path))?;
-
-            // Only copy content if file has size > 0
-            if entry.size.unwrap_or(0) > 0 {
-                let mut src_file = layer
-                    .open_file_std(&entry.name)
-                    .with_context(|| format!("Failed to open source file {:?}", entry.name))?;
-
-                match ioctl_ficlone(&dst_file, &src_file) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if force_copy {
-                            let mut dst = dst_file.into_std();
-                            std::io::copy(&mut src_file, &mut dst)
-                                .with_context(|| format!("Failed to copy file {:?}", path))?;
-                        } else {
-                            return Err(anyhow!("Reflink failed for {:?}: {}", path, e));
-                        }
-                    }
-                }
-            }
-
-            let std_perms = std::fs::Permissions::from_mode(entry.mode);
-            let perms = Permissions::from_std(std_perms);
-            parent
-                .set_permissions(filename, perms)
-                .with_context(|| format!("Failed to set permissions for {:?}", path))?;
-        }
-        TocEntryType::Hardlink => {
-            let link_target = entry.link_name.as_deref().unwrap_or("");
-            let _ = parent.remove_file(filename);
-            dest.hard_link(link_target, &parent, filename)
-                .with_context(|| {
-                    format!("Failed to create hard link {:?} -> {:?}", path, link_target)
-                })?;
-        }
-        TocEntryType::Char | TocEntryType::Block | TocEntryType::Fifo => {
-            // Skip device files and FIFOs - can't create as unprivileged user
-        }
-    }
-
-    Ok(())
-}
-
 fn output_toc(storage: &Storage, image_id: &str, pretty: bool) -> Result<()> {
     use cstor_rs::Toc;
 
@@ -1013,6 +782,264 @@ fn output_toc(storage: &Storage, image_id: &str, pretty: bool) -> Result<()> {
 
     println!("{}", json);
     Ok(())
+}
+
+/// Extract a layer to a directory using ProxiedStorage.
+///
+/// Uses the ProxiedStorage API for transparent access in both privileged
+/// and unprivileged modes.
+fn extract_layer_cmd(
+    storage_root: &Option<PathBuf>,
+    layer_ref: &str,
+    dest: PathBuf,
+    no_reflinks: bool,
+    preserve_ownership: bool,
+    no_permissions: bool,
+) -> Result<()> {
+    use cstor_rs::ProxiedStorage;
+    use cstor_rs::extract::ExtractionOptions;
+    use std::time::Instant;
+
+    // Validate destination doesn't exist
+    if dest.exists() {
+        anyhow::bail!("Destination directory already exists: {}", dest.display());
+    }
+    let parent = dest.parent().context("Destination path has no parent")?;
+    if !parent.exists() {
+        anyhow::bail!("Parent directory does not exist: {}", parent.display());
+    }
+
+    // Create destination directory
+    std::fs::create_dir(&dest).context("Failed to create destination directory")?;
+    let dest_dir = Dir::open_ambient_dir(&dest, ambient_authority())
+        .context("Failed to open destination directory")?;
+
+    // Build extraction options
+    let options = ExtractionOptions {
+        use_reflinks: !no_reflinks,
+        preserve_ownership,
+        preserve_permissions: !no_permissions,
+        process_whiteouts: true,
+    };
+
+    // Determine storage path
+    let storage_path = match storage_root {
+        Some(root) => root.clone(),
+        None => discover_storage_path()?,
+    };
+
+    // Create tokio runtime for async ProxiedStorage operations
+    let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
+
+    rt.block_on(async {
+        let start = Instant::now();
+
+        // Open storage with proxy support if needed
+        let mut storage = ProxiedStorage::open_with_proxy(&storage_path)
+            .await
+            .map_err(|e| anyhow!("Failed to open storage: {}", e))?;
+
+        if storage.is_proxied() {
+            eprintln!("Using proxied storage via userns helper");
+        }
+
+        eprintln!("Extracting layer {} to {}", layer_ref, dest.display());
+
+        // Extract the layer
+        let stats = storage
+            .extract_layer(layer_ref, &dest_dir, &options)
+            .await
+            .map_err(|e| anyhow!("Extraction failed: {}", e))?;
+
+        let elapsed = start.elapsed();
+
+        // Print stats
+        eprintln!();
+        eprintln!("Extraction completed in {:.2}s", elapsed.as_secs_f64());
+        eprintln!("  Files:      {}", stats.files_extracted);
+        eprintln!("  Directories: {}", stats.directories_created);
+        eprintln!("  Symlinks:   {}", stats.symlinks_created);
+        eprintln!("  Hardlinks:  {}", stats.hardlinks_created);
+        if stats.whiteouts_processed > 0 {
+            eprintln!("  Whiteouts:  {}", stats.whiteouts_processed);
+        }
+        if stats.entries_skipped > 0 {
+            eprintln!(
+                "  Skipped:    {} (device files, etc.)",
+                stats.entries_skipped
+            );
+        }
+        eprintln!();
+        eprintln!(
+            "  Bytes reflinked: {} ({:.2} MB)",
+            stats.bytes_reflinked,
+            stats.bytes_reflinked as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!(
+            "  Bytes copied:    {} ({:.2} MB)",
+            stats.bytes_copied,
+            stats.bytes_copied as f64 / (1024.0 * 1024.0)
+        );
+
+        // Shutdown proxy if used
+        storage
+            .shutdown()
+            .await
+            .map_err(|e| anyhow!("Failed to shutdown proxy: {}", e))?;
+
+        Ok(())
+    })
+}
+
+/// Extract an image to a directory using ProxiedStorage.
+///
+/// Flattens all layers and extracts to the destination directory using
+/// the ProxiedStorage API for transparent access in both privileged
+/// and unprivileged modes.
+fn extract_image_cmd(
+    storage_root: &Option<PathBuf>,
+    image_ref: &str,
+    dest: PathBuf,
+    no_reflinks: bool,
+    preserve_ownership: bool,
+    no_permissions: bool,
+) -> Result<()> {
+    use cstor_rs::ProxiedStorage;
+    use cstor_rs::extract::ExtractionOptions;
+    use std::time::Instant;
+
+    // Validate destination doesn't exist
+    if dest.exists() {
+        anyhow::bail!("Destination directory already exists: {}", dest.display());
+    }
+    let parent = dest.parent().context("Destination path has no parent")?;
+    if !parent.exists() {
+        anyhow::bail!("Parent directory does not exist: {}", parent.display());
+    }
+
+    // Create destination directory
+    std::fs::create_dir(&dest).context("Failed to create destination directory")?;
+    let dest_dir = Dir::open_ambient_dir(&dest, ambient_authority())
+        .context("Failed to open destination directory")?;
+
+    // Build extraction options
+    let options = ExtractionOptions {
+        use_reflinks: !no_reflinks,
+        preserve_ownership,
+        preserve_permissions: !no_permissions,
+        process_whiteouts: true,
+    };
+
+    // Determine storage path
+    let storage_path = match storage_root {
+        Some(root) => root.clone(),
+        None => discover_storage_path()?,
+    };
+
+    // Create tokio runtime for async ProxiedStorage operations
+    let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
+
+    rt.block_on(async {
+        let start = Instant::now();
+
+        // Open storage with proxy support if needed
+        let mut storage = ProxiedStorage::open_with_proxy(&storage_path)
+            .await
+            .map_err(|e| anyhow!("Failed to open storage: {}", e))?;
+
+        if storage.is_proxied() {
+            eprintln!("Using proxied storage via userns helper");
+        }
+
+        eprintln!("Extracting image {} to {}", image_ref, dest.display());
+
+        // Extract the image (all layers merged)
+        let stats = storage
+            .extract_image(image_ref, &dest_dir, &options)
+            .await
+            .map_err(|e| anyhow!("Extraction failed: {}", e))?;
+
+        let elapsed = start.elapsed();
+
+        // Print stats
+        eprintln!();
+        eprintln!("Extraction completed in {:.2}s", elapsed.as_secs_f64());
+        eprintln!("  Files:      {}", stats.files_extracted);
+        eprintln!("  Directories: {}", stats.directories_created);
+        eprintln!("  Symlinks:   {}", stats.symlinks_created);
+        eprintln!("  Hardlinks:  {}", stats.hardlinks_created);
+        if stats.whiteouts_processed > 0 {
+            eprintln!("  Whiteouts:  {}", stats.whiteouts_processed);
+        }
+        if stats.entries_skipped > 0 {
+            eprintln!(
+                "  Skipped:    {} (device files, etc.)",
+                stats.entries_skipped
+            );
+        }
+        eprintln!();
+        eprintln!(
+            "  Bytes reflinked: {} ({:.2} MB)",
+            stats.bytes_reflinked,
+            stats.bytes_reflinked as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!(
+            "  Bytes copied:    {} ({:.2} MB)",
+            stats.bytes_copied,
+            stats.bytes_copied as f64 / (1024.0 * 1024.0)
+        );
+
+        // Shutdown proxy if used
+        storage
+            .shutdown()
+            .await
+            .map_err(|e| anyhow!("Failed to shutdown proxy: {}", e))?;
+
+        Ok(())
+    })
+}
+
+/// Discover the default storage path.
+///
+/// This mirrors the logic in Storage::discover() but returns the path
+/// rather than opening the storage.
+fn discover_storage_path() -> Result<PathBuf> {
+    use std::env;
+
+    // 1. Check CONTAINERS_STORAGE_ROOT environment variable
+    if let Ok(root) = env::var("CONTAINERS_STORAGE_ROOT") {
+        let path = PathBuf::from(&root);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    // 2. Check rootless locations
+    if let Ok(home) = env::var("HOME") {
+        let home_path = PathBuf::from(&home);
+
+        // Try XDG_DATA_HOME first
+        if let Ok(xdg_data) = env::var("XDG_DATA_HOME") {
+            let path = PathBuf::from(xdg_data).join("containers/storage");
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+
+        // Fallback to ~/.local/share/containers/storage
+        let path = home_path.join(".local/share/containers/storage");
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    // 3. Check root location
+    let path = PathBuf::from("/var/lib/containers/storage");
+    if path.exists() {
+        return Ok(path);
+    }
+
+    anyhow::bail!("No valid storage location found. Searched default locations.")
 }
 
 /// Export a layer via the IPC protocol (PoC demonstration).
