@@ -100,11 +100,22 @@ pub struct LayerBuilder {
     /// The storage root.
     storage_root: Dir,
 
-    /// Staging directory for layer content.
+    /// Handle to the staging parent directory (.staging/).
+    /// Kept alive to make `/proc/self/fd/{fd}` paths valid.
     #[allow(dead_code)]
-    staging_dir: PathBuf,
+    staging_parent_handle: Dir,
 
-    /// The diff directory where files are placed.
+    /// Handle to the staging directory for this layer.
+    /// Kept alive to make `/proc/self/fd/{fd}` paths valid.
+    #[allow(dead_code)]
+    staging_handle: Dir,
+
+    /// Handle to the diff directory where files are placed.
+    /// Kept alive to make the diff_dir path (via /proc/self/fd/) valid.
+    #[allow(dead_code)]
+    diff_handle: Dir,
+
+    /// The diff directory path (as /proc/self/fd path).
     diff_dir: PathBuf,
 
     /// Parent layer ID (if any).
@@ -156,20 +167,17 @@ impl LayerBuilder {
 
         // Create diff directory
         staging.create_dir("diff")?;
+        let diff_handle = staging.open_dir("diff")?;
 
-        // Get absolute paths for operations
-        // Note: This is a workaround since cap-std doesn't expose the path
-        // In production, we'd use fd-relative operations throughout
-        let staging_dir = PathBuf::from(format!(
-            "/proc/self/fd/{}/{}",
-            staging_parent.as_raw_fd(),
-            layer_id
-        ));
-        let diff_dir = staging_dir.join("diff");
+        // Get path to diff directory for file operations.
+        // We use /proc/self/fd/{fd} to access via the open handle.
+        let diff_dir = PathBuf::from(format!("/proc/self/fd/{}", diff_handle.as_raw_fd()));
 
         Ok(Self {
             storage_root,
-            staging_dir,
+            staging_parent_handle: staging_parent,
+            staging_handle: staging,
+            diff_handle,
             diff_dir,
             parent_id: parent_id.map(|s| s.to_string()),
             entries: Vec::new(),
