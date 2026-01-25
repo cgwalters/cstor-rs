@@ -103,6 +103,7 @@ mod readatreader;
 
 // User namespace handling
 pub mod userns;
+pub mod userns_helper;
 
 // Re-export commonly used types
 pub use config::{AdditionalLayerStore, StorageConfig};
