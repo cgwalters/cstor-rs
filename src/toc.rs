@@ -10,6 +10,44 @@
 //! - Comparing layers
 //! - Building filesystem indexes
 //!
+//! # UID/GID Handling and User Namespaces
+//!
+//! The [`TocEntry::uid`] and [`TocEntry::gid`] fields contain **container UIDs**
+//! (e.g., 0 for root, 1000 for a regular user), not host-mapped UIDs.
+//!
+//! ## Where UIDs Come From
+//!
+//! | Location | UIDs Stored |
+//! |----------|-------------|
+//! | OCI tar archives | Container UIDs (per OCI spec) |
+//! | Tar-split segments | Container UIDs (raw tar header bytes) |
+//! | Files on disk (rootless, no idmap) | Host UIDs (100000+) |
+//! | Files on disk (with idmapped mounts) | Container UIDs |
+//!
+//! The tar-split metadata stores the **original tar header bytes**, which contain
+//! container-namespace UIDs. This is what cstor-rs parses to build the TOC.
+//!
+//! ## Implications for Consumers
+//!
+//! When using TOC metadata for operations like reflink-based copies:
+//!
+//! - **Content** (file bytes) can be reflinked directly - bytes are identical
+//!   regardless of ownership
+//! - **Metadata** (uid, gid, mode) comes from the TOC and may need transformation
+//!   depending on the target namespace
+//!
+//! For example, when copying to [composefs](https://github.com/containers/composefs):
+//! - Content goes to `objects/` directory (content-addressed by fsverity digest)
+//! - Metadata (including uid/gid from TOC) goes into the EROFS image
+//!
+//! ## No Translation in cstor-rs
+//!
+//! This library reports container UIDs as-is from tar-split. Any UID translation
+//! for different target namespaces is the **caller's responsibility**. The
+//! containers/storage Go library provides `RawToHost`/`RawToContainer` functions
+//! for this purpose; equivalent Rust implementations would use mappings from
+//! `/etc/subuid` and `/etc/subgid`.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -142,10 +180,20 @@ pub struct TocEntry {
     /// Permission and mode bits.
     pub mode: u32,
 
-    /// User ID of the owner.
+    /// User ID of the owner (container namespace).
+    ///
+    /// This is the UID from the original tar header, which uses container-namespace
+    /// values (e.g., 0 for root). In rootless storage without idmapped mounts,
+    /// files on disk have different (host-mapped) UIDs, but this field always
+    /// reflects the container UID.
+    ///
+    /// See the [module documentation](self) for details on UID/GID handling.
     pub uid: u32,
 
-    /// Group ID of the owner.
+    /// Group ID of the owner (container namespace).
+    ///
+    /// This is the GID from the original tar header, which uses container-namespace
+    /// values. See [`uid`](Self::uid) for more details.
     pub gid: u32,
 
     /// Username of the owner.
