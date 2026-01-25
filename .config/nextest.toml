@@ -1,0 +1,17 @@
+# nextest configuration for cstor-rs
+# https://nexte.st/book/configuration.html
+
+[profile.default]
+# Fail fast on first test failure
+fail-fast = true
+
+# Number of retries for flaky tests
+retries = 0
+
+# Default test timeout
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[profile.ci]
+# CI-specific configuration
+fail-fast = false
+retries = 2
