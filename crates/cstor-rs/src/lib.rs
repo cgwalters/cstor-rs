@@ -19,7 +19,7 @@
 //! # Key Features
 //!
 //! - **Capability-based security**: All file access via `cap_std::fs::Dir` handles
-//! - **Read-only**: No modifications to storage
+//! - **Layer creation**: Build new layers with reflink support
 //! - **Zero-copy access**: File descriptors instead of data copies
 //! - **Safe by design**: No path traversal vulnerabilities
 //! - **Tar-split integration**: Bit-for-bit identical TAR reconstruction
@@ -81,8 +81,12 @@ pub mod storage;
 
 // Tar handling
 pub mod tar_split;
+pub mod tar_split_writer;
 pub mod tar_writer;
 pub mod toc;
+
+// Layer creation
+pub mod layer_builder;
 
 // Splitfdstream binary format
 pub mod splitfdstream;
@@ -110,6 +114,10 @@ pub use tar_split::{
 };
 pub use tar_writer::{write_file_data, write_tar_footer, write_tar_header};
 pub use toc::{Toc, TocEntry, TocEntryType};
+
+// Layer creation exports
+pub use layer_builder::LayerBuilder;
+pub use tar_split_writer::TarSplitWriter;
 
 // Re-export OCI spec types for convenience
 pub use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest};
