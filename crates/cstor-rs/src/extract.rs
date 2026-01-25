@@ -76,6 +76,10 @@ pub struct ExtractionStats {
     pub whiteouts_processed: usize,
     /// Number of entries skipped (device files, etc.).
     pub entries_skipped: usize,
+    /// Number of permission set failures (non-fatal).
+    pub permission_failures: usize,
+    /// Number of ownership set failures (non-fatal).
+    pub ownership_failures: usize,
 }
 
 /// Options for extraction.
@@ -275,6 +279,8 @@ pub fn extract_image(
         total_stats.bytes_copied += layer_stats.bytes_copied;
         total_stats.whiteouts_processed += layer_stats.whiteouts_processed;
         total_stats.entries_skipped += layer_stats.entries_skipped;
+        total_stats.permission_failures += layer_stats.permission_failures;
+        total_stats.ownership_failures += layer_stats.ownership_failures;
     }
 
     Ok(total_stats)
@@ -363,16 +369,22 @@ fn extract_toc_entry(
             }
             if options.preserve_permissions {
                 let perms = Permissions::from_std(std::fs::Permissions::from_mode(entry.mode));
-                let _ = dest.set_permissions(path, perms);
+                if dest.set_permissions(path, perms).is_err() {
+                    stats.permission_failures += 1;
+                }
             }
             if options.preserve_ownership {
-                let _ = rustix::fs::chownat(
+                if rustix::fs::chownat(
                     dest,
                     path,
                     Some(Uid::from_raw(entry.uid)),
                     Some(Gid::from_raw(entry.gid)),
                     AtFlags::empty(),
-                );
+                )
+                .is_err()
+                {
+                    stats.ownership_failures += 1;
+                }
             }
             stats.directories_created += 1;
         }
@@ -397,16 +409,22 @@ fn extract_toc_entry(
             // Set metadata
             if options.preserve_permissions {
                 let perms = Permissions::from_std(std::fs::Permissions::from_mode(entry.mode));
-                let _ = dest.set_permissions(path, perms);
+                if dest.set_permissions(path, perms).is_err() {
+                    stats.permission_failures += 1;
+                }
             }
             if options.preserve_ownership {
-                let _ = rustix::fs::chownat(
+                if rustix::fs::chownat(
                     dest,
                     path,
                     Some(Uid::from_raw(entry.uid)),
                     Some(Gid::from_raw(entry.gid)),
                     AtFlags::empty(),
-                );
+                )
+                .is_err()
+                {
+                    stats.ownership_failures += 1;
+                }
             }
         }
         TocEntryType::Symlink => {
@@ -414,13 +432,17 @@ fn extract_toc_entry(
                 let _ = dest.remove_file(path);
                 dest.symlink_contents(target, path)?;
                 if options.preserve_ownership {
-                    let _ = rustix::fs::chownat(
+                    if rustix::fs::chownat(
                         dest,
                         path,
                         Some(Uid::from_raw(entry.uid)),
                         Some(Gid::from_raw(entry.gid)),
                         AtFlags::SYMLINK_NOFOLLOW,
-                    );
+                    )
+                    .is_err()
+                    {
+                        stats.ownership_failures += 1;
+                    }
                 }
                 stats.symlinks_created += 1;
             }
@@ -512,16 +534,22 @@ fn process_non_file_entry(
             }
             if options.preserve_permissions {
                 let perms = Permissions::from_std(std::fs::Permissions::from_mode(header.mode));
-                let _ = dest.set_permissions(path, perms);
+                if dest.set_permissions(path, perms).is_err() {
+                    stats.permission_failures += 1;
+                }
             }
             if options.preserve_ownership {
-                let _ = rustix::fs::chownat(
+                if rustix::fs::chownat(
                     dest,
                     path,
                     Some(Uid::from_raw(header.uid)),
                     Some(Gid::from_raw(header.gid)),
                     AtFlags::empty(),
-                );
+                )
+                .is_err()
+                {
+                    stats.ownership_failures += 1;
+                }
             }
             stats.directories_created += 1;
         }
@@ -531,13 +559,17 @@ fn process_non_file_entry(
                 let _ = dest.remove_file(path);
                 dest.symlink_contents(&header.linkname, path)?;
                 if options.preserve_ownership {
-                    let _ = rustix::fs::chownat(
+                    if rustix::fs::chownat(
                         dest,
                         path,
                         Some(Uid::from_raw(header.uid)),
                         Some(Gid::from_raw(header.gid)),
                         AtFlags::SYMLINK_NOFOLLOW,
-                    );
+                    )
+                    .is_err()
+                    {
+                        stats.ownership_failures += 1;
+                    }
                 }
                 stats.symlinks_created += 1;
             }
@@ -562,16 +594,22 @@ fn process_non_file_entry(
                 drop(file);
                 if options.preserve_permissions {
                     let perms = Permissions::from_std(std::fs::Permissions::from_mode(header.mode));
-                    let _ = dest.set_permissions(path, perms);
+                    if dest.set_permissions(path, perms).is_err() {
+                        stats.permission_failures += 1;
+                    }
                 }
                 if options.preserve_ownership {
-                    let _ = rustix::fs::chownat(
+                    if rustix::fs::chownat(
                         dest,
                         path,
                         Some(Uid::from_raw(header.uid)),
                         Some(Gid::from_raw(header.gid)),
                         AtFlags::empty(),
-                    );
+                    )
+                    .is_err()
+                    {
+                        stats.ownership_failures += 1;
+                    }
                 }
                 stats.files_extracted += 1;
             }
@@ -621,16 +659,22 @@ fn extract_regular_file(
     // Set metadata
     if options.preserve_permissions {
         let perms = Permissions::from_std(std::fs::Permissions::from_mode(header.mode));
-        let _ = dest.set_permissions(path, perms);
+        if dest.set_permissions(path, perms).is_err() {
+            stats.permission_failures += 1;
+        }
     }
     if options.preserve_ownership {
-        let _ = rustix::fs::chownat(
+        if rustix::fs::chownat(
             dest,
             path,
             Some(Uid::from_raw(header.uid)),
             Some(Gid::from_raw(header.gid)),
             AtFlags::empty(),
-        );
+        )
+        .is_err()
+        {
+            stats.ownership_failures += 1;
+        }
     }
 
     Ok(())
@@ -690,8 +734,16 @@ fn extract_file_content(
     Ok(())
 }
 
+/// Maximum size for GNU long names (64KB should be more than enough for any path).
+const MAX_GNU_LONG_NAME_SIZE: u64 = 64 * 1024;
+
 /// Read a GNU long name/linkname from a file descriptor.
 fn read_gnu_long_string(fd: OwnedFd, size: u64) -> Result<String> {
+    if size > MAX_GNU_LONG_NAME_SIZE {
+        return Err(StorageError::TarSplitError(
+            "GNU long name too large".into(),
+        ));
+    }
     let mut file = std::fs::File::from(fd);
     let mut buffer = vec![0u8; size as usize];
     file.read_exact(&mut buffer)
@@ -849,6 +901,8 @@ mod tests {
         assert_eq!(stats.bytes_copied, 0);
         assert_eq!(stats.whiteouts_processed, 0);
         assert_eq!(stats.entries_skipped, 0);
+        assert_eq!(stats.permission_failures, 0);
+        assert_eq!(stats.ownership_failures, 0);
     }
 
     /// Test that extraction works with real storage.

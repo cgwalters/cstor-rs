@@ -79,14 +79,12 @@
 //! Library users must call [`init_if_helper`] early in their `main()` function:
 //!
 //! ```no_run
-//! fn main() {
-//!     // This must be called before any other cstor-rs operations.
-//!     // If this process was spawned as a userns helper, it will
-//!     // serve requests and exit, never returning.
-//!     cstor_rs::userns_helper::init_if_helper();
-//!     
-//!     // Normal application code continues here...
-//! }
+//! // This must be called before any other cstor-rs operations.
+//! // If this process was spawned as a userns helper, it will
+//! // serve requests and exit, never returning.
+//! cstor_rs::userns_helper::init_if_helper();
+//!
+//! // Normal application code continues here...
 //! ```
 
 use std::os::fd::AsFd;
@@ -111,6 +109,25 @@ use crate::userns::can_bypass_file_permissions;
 
 /// Environment variable that indicates this process is a userns helper.
 const HELPER_ENV: &str = "__CSTOR_USERNS_HELPER";
+
+/// JSON-RPC 2.0 error codes.
+///
+/// These codes follow the JSON-RPC 2.0 specification:
+/// - Standard errors: -32700 to -32600
+/// - Server errors: -32099 to -32000 (implementation-defined)
+mod error_codes {
+    /// Invalid params - the params passed to a method are invalid.
+    pub const INVALID_PARAMS: i32 = -32602;
+
+    /// Method not found - the requested method does not exist.
+    pub const METHOD_NOT_FOUND: i32 = -32601;
+
+    /// Resource not found - the requested resource (image, layer, etc.) was not found.
+    pub const RESOURCE_NOT_FOUND: i32 = -32000;
+
+    /// Internal error - a server-side error occurred (I/O, storage access, etc.).
+    pub const INTERNAL_ERROR: i32 = -32003;
+}
 
 /// JSON-RPC method names.
 mod methods {
@@ -315,12 +332,10 @@ pub enum HelperError {
 /// # Example
 ///
 /// ```no_run
-/// fn main() {
-///     // Must be first!
-///     cstor_rs::userns_helper::init_if_helper();
-///     
-///     // Rest of your application...
-/// }
+/// // Must be first in your main()!
+/// cstor_rs::userns_helper::init_if_helper();
+///
+/// // Rest of your application...
 /// ```
 pub fn init_if_helper() {
     // Check if we're a helper via environment variable
@@ -463,23 +478,38 @@ async fn handle_stream_layer(
         .params
         .as_ref()
         .and_then(|p| serde_json::from_value(p.clone()).ok())
-        .ok_or((-32602, "invalid params for streamLayer".to_string()))?;
+        .ok_or((
+            error_codes::INVALID_PARAMS,
+            "invalid params for streamLayer".to_string(),
+        ))?;
 
-    let storage = Storage::open(&params.storage_path)
-        .map_err(|e| (-32003, format!("failed to open storage: {}", e)))?;
+    let storage = Storage::open(&params.storage_path).map_err(|e| {
+        (
+            error_codes::INTERNAL_ERROR,
+            format!("failed to open storage: {}", e),
+        )
+    })?;
 
-    let layer = Layer::open(&storage, &params.layer_id)
-        .map_err(|e| (-32000, format!("layer not found: {}", e)))?;
+    let layer = Layer::open(&storage, &params.layer_id).map_err(|e| {
+        (
+            error_codes::RESOURCE_NOT_FOUND,
+            format!("layer not found: {}", e),
+        )
+    })?;
 
-    let mut stream = TarSplitFdStream::new(&storage, &layer)
-        .map_err(|e| (-32003, format!("failed to create tar-split stream: {}", e)))?;
+    let mut stream = TarSplitFdStream::new(&storage, &layer).map_err(|e| {
+        (
+            error_codes::INTERNAL_ERROR,
+            format!("failed to create tar-split stream: {}", e),
+        )
+    })?;
 
     let mut items_sent = 0usize;
 
     // Stream all items as notifications
     while let Some(item) = stream
         .next()
-        .map_err(|e| (-32003, format!("stream error: {}", e)))?
+        .map_err(|e| (error_codes::INTERNAL_ERROR, format!("stream error: {}", e)))?
     {
         match item {
             TarSplitItem::Segment(bytes) => {
@@ -492,10 +522,12 @@ async fn handle_stream_layer(
                     Some(serde_json::to_value(&params).unwrap()),
                 );
                 let message = MessageWithFds::new(JsonRpcMessage::Notification(notif), vec![]);
-                sender
-                    .send(message)
-                    .await
-                    .map_err(|e| (-32003, format!("failed to send segment: {}", e)))?;
+                sender.send(message).await.map_err(|e| {
+                    (
+                        error_codes::INTERNAL_ERROR,
+                        format!("failed to send segment: {}", e),
+                    )
+                })?;
                 items_sent += 1;
             }
             TarSplitItem::FileContent { fd, size, name } => {
@@ -506,10 +538,12 @@ async fn handle_stream_layer(
                     Some(serde_json::to_value(&params).unwrap()),
                 );
                 let message = MessageWithFds::new(JsonRpcMessage::Notification(notif), vec![fd]);
-                sender
-                    .send(message)
-                    .await
-                    .map_err(|e| (-32003, format!("failed to send file: {}", e)))?;
+                sender.send(message).await.map_err(|e| {
+                    (
+                        error_codes::INTERNAL_ERROR,
+                        format!("failed to send file: {}", e),
+                    )
+                })?;
                 items_sent += 1;
             }
         }
@@ -520,10 +554,12 @@ async fn handle_stream_layer(
     let response =
         JsonRpcResponse::success(serde_json::to_value(result).unwrap(), request.id.clone());
     let message = MessageWithFds::new(JsonRpcMessage::Response(response), vec![]);
-    sender
-        .send(message)
-        .await
-        .map_err(|e| (-32003, format!("failed to send response: {}", e)))?;
+    sender.send(message).await.map_err(|e| {
+        (
+            error_codes::INTERNAL_ERROR,
+            format!("failed to send response: {}", e),
+        )
+    })?;
 
     Ok(())
 }
@@ -545,7 +581,10 @@ fn handle_request(
                 Some(p) => p,
                 None => {
                     return (
-                        Err((-32602, "invalid params: missing 'path' field".to_string())),
+                        Err((
+                            error_codes::INVALID_PARAMS,
+                            "invalid params: missing 'path' field".to_string(),
+                        )),
                         vec![],
                     );
                 }
@@ -557,7 +596,13 @@ fn handle_request(
                     let result = OpenFileResult { success: true };
                     (Ok(serde_json::to_value(result).unwrap()), vec![fd])
                 }
-                Err(e) => (Err((-32003, format!("failed to open file: {}", e))), vec![]),
+                Err(e) => (
+                    Err((
+                        error_codes::INTERNAL_ERROR,
+                        format!("failed to open file: {}", e),
+                    )),
+                    vec![],
+                ),
             }
         }
         methods::LIST_IMAGES => handle_list_images(request),
@@ -570,7 +615,10 @@ fn handle_request(
             (Ok(serde_json::json!({"success": true})), vec![])
         }
         _ => (
-            Err((-32601, format!("method not found: {}", request.method))),
+            Err((
+                error_codes::METHOD_NOT_FOUND,
+                format!("method not found: {}", request.method),
+            )),
             vec![],
         ),
     }
@@ -591,7 +639,10 @@ fn handle_list_images(
         Some(p) => p,
         None => {
             return (
-                Err((-32602, "invalid params for listImages".to_string())),
+                Err((
+                    error_codes::INVALID_PARAMS,
+                    "invalid params for listImages".to_string(),
+                )),
                 vec![],
             );
         }
@@ -601,7 +652,10 @@ fn handle_list_images(
         Ok(s) => s,
         Err(e) => {
             return (
-                Err((-32003, format!("failed to open storage: {}", e))),
+                Err((
+                    error_codes::INTERNAL_ERROR,
+                    format!("failed to open storage: {}", e),
+                )),
                 vec![],
             );
         }
@@ -611,7 +665,10 @@ fn handle_list_images(
         Ok(imgs) => imgs,
         Err(e) => {
             return (
-                Err((-32003, format!("failed to list images: {}", e))),
+                Err((
+                    error_codes::INTERNAL_ERROR,
+                    format!("failed to list images: {}", e),
+                )),
                 vec![],
             );
         }
@@ -646,7 +703,10 @@ fn handle_get_image(
         Some(p) => p,
         None => {
             return (
-                Err((-32602, "invalid params for getImage".to_string())),
+                Err((
+                    error_codes::INVALID_PARAMS,
+                    "invalid params for getImage".to_string(),
+                )),
                 vec![],
             );
         }
@@ -656,7 +716,10 @@ fn handle_get_image(
         Ok(s) => s,
         Err(e) => {
             return (
-                Err((-32003, format!("failed to open storage: {}", e))),
+                Err((
+                    error_codes::INTERNAL_ERROR,
+                    format!("failed to open storage: {}", e),
+                )),
                 vec![],
             );
         }
@@ -667,7 +730,15 @@ fn handle_get_image(
         Ok(img) => img,
         Err(_) => match storage.find_image_by_name(&params.image_ref) {
             Ok(img) => img,
-            Err(e) => return (Err((-32000, format!("image not found: {}", e))), vec![]),
+            Err(e) => {
+                return (
+                    Err((
+                        error_codes::RESOURCE_NOT_FOUND,
+                        format!("image not found: {}", e),
+                    )),
+                    vec![],
+                );
+            }
         },
     };
 
@@ -675,7 +746,10 @@ fn handle_get_image(
         Ok(ids) => ids,
         Err(e) => {
             return (
-                Err((-32003, format!("failed to get layers: {}", e))),
+                Err((
+                    error_codes::INTERNAL_ERROR,
+                    format!("failed to get layers: {}", e),
+                )),
                 vec![],
             );
         }
@@ -704,7 +778,10 @@ fn handle_get_layer_metadata(
         Some(p) => p,
         None => {
             return (
-                Err((-32602, "invalid params for getLayerMetadata".to_string())),
+                Err((
+                    error_codes::INVALID_PARAMS,
+                    "invalid params for getLayerMetadata".to_string(),
+                )),
                 vec![],
             );
         }
@@ -714,7 +791,10 @@ fn handle_get_layer_metadata(
         Ok(s) => s,
         Err(e) => {
             return (
-                Err((-32003, format!("failed to open storage: {}", e))),
+                Err((
+                    error_codes::INTERNAL_ERROR,
+                    format!("failed to open storage: {}", e),
+                )),
                 vec![],
             );
         }
@@ -722,7 +802,15 @@ fn handle_get_layer_metadata(
 
     let metadata = match storage.get_layer_metadata(&params.layer_id) {
         Ok(m) => m,
-        Err(e) => return (Err((-32000, format!("layer not found: {}", e))), vec![]),
+        Err(e) => {
+            return (
+                Err((
+                    error_codes::RESOURCE_NOT_FOUND,
+                    format!("layer not found: {}", e),
+                )),
+                vec![],
+            );
+        }
     };
 
     let result = GetLayerMetadataResult {
@@ -749,7 +837,10 @@ fn handle_get_layer_toc(
         Some(p) => p,
         None => {
             return (
-                Err((-32602, "invalid params for getLayerToc".to_string())),
+                Err((
+                    error_codes::INVALID_PARAMS,
+                    "invalid params for getLayerToc".to_string(),
+                )),
                 vec![],
             );
         }
@@ -759,7 +850,10 @@ fn handle_get_layer_toc(
         Ok(s) => s,
         Err(e) => {
             return (
-                Err((-32003, format!("failed to open storage: {}", e))),
+                Err((
+                    error_codes::INTERNAL_ERROR,
+                    format!("failed to open storage: {}", e),
+                )),
                 vec![],
             );
         }
@@ -767,14 +861,25 @@ fn handle_get_layer_toc(
 
     let layer = match Layer::open(&storage, &params.layer_id) {
         Ok(l) => l,
-        Err(e) => return (Err((-32000, format!("layer not found: {}", e))), vec![]),
+        Err(e) => {
+            return (
+                Err((
+                    error_codes::RESOURCE_NOT_FOUND,
+                    format!("layer not found: {}", e),
+                )),
+                vec![],
+            );
+        }
     };
 
     let toc = match Toc::from_layer(&storage, &layer) {
         Ok(t) => t,
         Err(e) => {
             return (
-                Err((-32003, format!("failed to generate TOC: {}", e))),
+                Err((
+                    error_codes::INTERNAL_ERROR,
+                    format!("failed to generate TOC: {}", e),
+                )),
                 vec![],
             );
         }
@@ -799,7 +904,10 @@ fn handle_get_image_toc(
         Some(p) => p,
         None => {
             return (
-                Err((-32602, "invalid params for getImageToc".to_string())),
+                Err((
+                    error_codes::INVALID_PARAMS,
+                    "invalid params for getImageToc".to_string(),
+                )),
                 vec![],
             );
         }
@@ -809,7 +917,10 @@ fn handle_get_image_toc(
         Ok(s) => s,
         Err(e) => {
             return (
-                Err((-32003, format!("failed to open storage: {}", e))),
+                Err((
+                    error_codes::INTERNAL_ERROR,
+                    format!("failed to open storage: {}", e),
+                )),
                 vec![],
             );
         }
@@ -817,14 +928,25 @@ fn handle_get_image_toc(
 
     let image = match storage.get_image(&params.image_id) {
         Ok(img) => img,
-        Err(e) => return (Err((-32000, format!("image not found: {}", e))), vec![]),
+        Err(e) => {
+            return (
+                Err((
+                    error_codes::RESOURCE_NOT_FOUND,
+                    format!("image not found: {}", e),
+                )),
+                vec![],
+            );
+        }
     };
 
     let toc = match Toc::from_image(&storage, &image) {
         Ok(t) => t,
         Err(e) => {
             return (
-                Err((-32003, format!("failed to generate TOC: {}", e))),
+                Err((
+                    error_codes::INTERNAL_ERROR,
+                    format!("failed to generate TOC: {}", e),
+                )),
                 vec![],
             );
         }
@@ -1370,8 +1492,7 @@ impl ProxiedStorage {
         } else {
             // Need proxy - spawn it
             let proxy = StorageProxy::spawn().await?.ok_or_else(|| {
-                HelperError::Spawn(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                HelperError::Spawn(std::io::Error::other(
                     "failed to determine if proxy is needed",
                 ))
             })?;
@@ -1560,7 +1681,9 @@ impl ProxiedStorage {
                     HelperError::HelperError(format!("failed to create stream: {}", e))
                 })?;
 
-                Ok(LayerContentStream::Direct(DirectLayerStream { stream }))
+                Ok(LayerContentStream::Direct(Box::new(DirectLayerStream {
+                    stream,
+                })))
             }
             StorageMode::Proxied { proxy, path } => {
                 let stream = proxy
@@ -1708,6 +1831,8 @@ impl ProxiedStorage {
                     total_stats.bytes_copied += layer_stats.bytes_copied;
                     total_stats.whiteouts_processed += layer_stats.whiteouts_processed;
                     total_stats.entries_skipped += layer_stats.entries_skipped;
+                    total_stats.permission_failures += layer_stats.permission_failures;
+                    total_stats.ownership_failures += layer_stats.ownership_failures;
                 }
 
                 Ok(total_stats)
@@ -1723,7 +1848,9 @@ impl ProxiedStorage {
 #[derive(Debug)]
 pub enum LayerContentStream<'a> {
     /// Direct stream (no proxy).
-    Direct(DirectLayerStream),
+    ///
+    /// Boxed to reduce enum size variance between variants.
+    Direct(Box<DirectLayerStream>),
     /// Proxied stream (via userns helper).
     Proxied(ProxiedLayerStream<'a>),
 }
