@@ -71,11 +71,12 @@
 //! # Ok::<(), cstor_rs::userns::UsernsError>(())
 //! ```
 
-use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::Command;
 
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use rustix::process::{getgid, getuid};
 use rustix::thread::{CapabilitySet, capabilities};
 use thiserror::Error;
@@ -152,6 +153,47 @@ pub enum UsernsError {
     /// Failed to read /proc/self/uid_map or gid_map.
     #[error("failed to read current ID mappings: {0}")]
     ReadCurrentMappings(#[source] std::io::Error),
+
+    /// Failed to open /etc directory.
+    #[error("failed to open /etc: {0}")]
+    OpenEtc(#[source] std::io::Error),
+}
+
+/// Handle to the `/etc` directory for reading configuration files.
+///
+/// This allows callers to provide their own `/etc` directory handle,
+/// which is useful for:
+/// - Testing with mock configuration files
+/// - Containerized environments with different `/etc` locations
+/// - Security-conscious code that wants to avoid ambient authority
+///
+/// If not provided, functions will open `/etc` using ambient authority.
+#[derive(Debug)]
+pub struct EtcDir {
+    dir: Dir,
+}
+
+impl EtcDir {
+    /// Create an `EtcDir` from an existing directory handle.
+    ///
+    /// The directory should contain `subuid`, `subgid`, and optionally `passwd` files.
+    pub fn new(dir: Dir) -> Self {
+        Self { dir }
+    }
+
+    /// Open the system `/etc` directory using ambient authority.
+    ///
+    /// This is the default behavior when no `EtcDir` is provided.
+    pub fn open_system() -> Result<Self, UsernsError> {
+        let dir =
+            Dir::open_ambient_dir("/etc", ambient_authority()).map_err(UsernsError::OpenEtc)?;
+        Ok(Self { dir })
+    }
+
+    /// Get a reference to the underlying directory handle.
+    pub fn as_dir(&self) -> &Dir {
+        &self.dir
+    }
 }
 
 /// Check if the current process can read arbitrary files regardless of permissions.
@@ -228,18 +270,45 @@ pub struct SubIdRange {
     pub count: u32,
 }
 
-/// Parse /etc/subuid or /etc/subgid file for a specific user.
+/// Which subid file type we're parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubIdFileType {
+    /// /etc/subuid
+    Uid,
+    /// /etc/subgid
+    Gid,
+}
+
+impl SubIdFileType {
+    fn filename(self) -> &'static str {
+        match self {
+            SubIdFileType::Uid => "subuid",
+            SubIdFileType::Gid => "subgid",
+        }
+    }
+
+    fn error_path(self) -> &'static str {
+        match self {
+            SubIdFileType::Uid => "/etc/subuid",
+            SubIdFileType::Gid => "/etc/subgid",
+        }
+    }
+}
+
+/// Parse a subuid or subgid file from an `/etc` directory handle.
 ///
 /// Returns all ranges allocated to the user. Matches by username or numeric UID.
-pub fn parse_subid_file(
-    path: &Path,
+fn parse_subid_from_etc(
+    etc_dir: &Dir,
+    file_type: SubIdFileType,
     username: &str,
     uid: Option<u32>,
 ) -> Result<Vec<SubIdRange>, UsernsError> {
     let uid_str = uid.map(|u| u.to_string());
-    let path_str = path.to_string_lossy();
+    let filename = file_type.filename();
+    let error_path = file_type.error_path();
 
-    let file = match File::open(path) {
+    let file = match etc_dir.open(filename) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // File doesn't exist - return empty (will try other sources)
@@ -247,26 +316,74 @@ pub fn parse_subid_file(
         }
         Err(e) => {
             return Err(UsernsError::ReadSubidFile {
-                path: if path_str.contains("subuid") {
-                    "/etc/subuid"
-                } else {
-                    "/etc/subgid"
-                },
+                path: error_path,
                 source: e,
             });
         }
     };
 
-    let reader = BufReader::new(file);
+    parse_subid_reader(
+        BufReader::new(file),
+        error_path,
+        username,
+        uid_str.as_deref(),
+    )
+}
+
+/// Parse /etc/subuid or /etc/subgid file for a specific user.
+///
+/// Returns all ranges allocated to the user. Matches by username or numeric UID.
+///
+/// This function opens the file at the given path using ambient authority.
+/// For fd-relative access, use [`read_subid_mappings_with_etc`] with an [`EtcDir`] handle.
+pub fn parse_subid_file(
+    path: &Path,
+    username: &str,
+    uid: Option<u32>,
+) -> Result<Vec<SubIdRange>, UsernsError> {
+    let uid_str = uid.map(|u| u.to_string());
+    let path_str = path.to_string_lossy();
+    let error_path: &'static str = if path_str.contains("subuid") {
+        "/etc/subuid"
+    } else {
+        "/etc/subgid"
+    };
+
+    // Open the file directly at the given path (for backward compatibility with tests)
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // File doesn't exist - return empty (will try other sources)
+            return Ok(Vec::new());
+        }
+        Err(e) => {
+            return Err(UsernsError::ReadSubidFile {
+                path: error_path,
+                source: e,
+            });
+        }
+    };
+
+    parse_subid_reader(
+        BufReader::new(file),
+        error_path,
+        username,
+        uid_str.as_deref(),
+    )
+}
+
+/// Internal helper to parse subid content from any reader.
+fn parse_subid_reader<R: BufRead>(
+    reader: R,
+    error_path: &'static str,
+    username: &str,
+    uid_str: Option<&str>,
+) -> Result<Vec<SubIdRange>, UsernsError> {
     let mut ranges = Vec::new();
 
     for (line_num, line_result) in reader.lines().enumerate() {
         let line = line_result.map_err(|e| UsernsError::ReadSubidFile {
-            path: if path_str.contains("subuid") {
-                "/etc/subuid"
-            } else {
-                "/etc/subgid"
-            },
+            path: error_path,
             source: e,
         })?;
 
@@ -280,36 +397,24 @@ pub fn parse_subid_file(
         let parts: Vec<&str> = line.split(':').collect();
         if parts.len() != 3 {
             return Err(UsernsError::InvalidFormat {
-                path: if path_str.contains("subuid") {
-                    "/etc/subuid"
-                } else {
-                    "/etc/subgid"
-                },
+                path: error_path,
                 line_num: line_num + 1,
                 details: format!("expected 3 colon-separated fields, got {}", parts.len()),
             });
         }
 
         // Match by username OR by numeric UID string
-        let matches = parts[0] == username || uid_str.as_deref() == Some(parts[0]);
+        let matches = parts[0] == username || uid_str == Some(parts[0]);
 
         if matches {
             let start: u32 = parts[1].parse().map_err(|_| UsernsError::InvalidFormat {
-                path: if path_str.contains("subuid") {
-                    "/etc/subuid"
-                } else {
-                    "/etc/subgid"
-                },
+                path: error_path,
                 line_num: line_num + 1,
                 details: format!("invalid start ID: {}", parts[1]),
             })?;
 
             let count: u32 = parts[2].parse().map_err(|_| UsernsError::InvalidFormat {
-                path: if path_str.contains("subuid") {
-                    "/etc/subuid"
-                } else {
-                    "/etc/subgid"
-                },
+                path: error_path,
                 line_num: line_num + 1,
                 details: format!("invalid count: {}", parts[2]),
             })?;
@@ -349,8 +454,8 @@ pub fn parse_current_id_mappings(uid: bool) -> Result<Vec<IdMap>, UsernsError> {
     Ok(maps)
 }
 
-/// Get the current username.
-fn get_current_username() -> Result<String, UsernsError> {
+/// Get the current username using the provided `/etc` directory.
+fn get_current_username_with_etc(etc_dir: &Dir) -> Result<String, UsernsError> {
     // Try $USER first
     if let Ok(user) = std::env::var("USER") {
         return Ok(user);
@@ -358,7 +463,8 @@ fn get_current_username() -> Result<String, UsernsError> {
 
     // Fall back to getpwuid via /etc/passwd parsing
     let uid = getuid().as_raw();
-    let passwd = std::fs::read_to_string("/etc/passwd")
+    let passwd = etc_dir
+        .read_to_string("passwd")
         .map_err(|e| UsernsError::CurrentUser(format!("failed to read /etc/passwd: {}", e)))?;
 
     for line in passwd.lines() {
@@ -400,29 +506,32 @@ pub fn ranges_to_id_maps(ranges: &[SubIdRange], real_id: u32) -> Vec<IdMap> {
     maps
 }
 
-/// Read subordinate ID mappings for a user.
+/// Read subordinate ID mappings for a user using an explicit `/etc` directory.
 ///
 /// If `username` is None, uses the current user.
 ///
 /// Returns (uid_maps, gid_maps).
 ///
 /// This function tries multiple sources:
-/// 1. /etc/subuid and /etc/subgid files
+/// 1. `subuid` and `subgid` files from the provided `/etc` directory
 /// 2. Current /proc/self/uid_map and gid_map (if already in a userns)
-pub fn read_subid_mappings(
+pub fn read_subid_mappings_with_etc(
+    etc_dir: &EtcDir,
     username: Option<&str>,
 ) -> Result<(Vec<IdMap>, Vec<IdMap>), UsernsError> {
     let username = match username {
         Some(u) => u.to_string(),
-        None => get_current_username()?,
+        None => get_current_username_with_etc(etc_dir.as_dir())?,
     };
 
     let uid = getuid().as_raw();
     let gid = getgid().as_raw();
 
-    // Try /etc/subuid and /etc/subgid first
-    let uid_ranges = parse_subid_file(Path::new("/etc/subuid"), &username, Some(uid))?;
-    let gid_ranges = parse_subid_file(Path::new("/etc/subgid"), &username, Some(gid))?;
+    // Try subuid and subgid from the provided etc directory
+    let uid_ranges =
+        parse_subid_from_etc(etc_dir.as_dir(), SubIdFileType::Uid, &username, Some(uid))?;
+    let gid_ranges =
+        parse_subid_from_etc(etc_dir.as_dir(), SubIdFileType::Gid, &username, Some(gid))?;
 
     if !uid_ranges.is_empty() && !gid_ranges.is_empty() {
         let uid_maps = ranges_to_id_maps(&uid_ranges, uid);
@@ -453,6 +562,25 @@ pub fn read_subid_mappings(
         kind: "subgid",
         username,
     })
+}
+
+/// Read subordinate ID mappings for a user.
+///
+/// If `username` is None, uses the current user.
+///
+/// Returns (uid_maps, gid_maps).
+///
+/// This function tries multiple sources:
+/// 1. /etc/subuid and /etc/subgid files
+/// 2. Current /proc/self/uid_map and gid_map (if already in a userns)
+///
+/// This function opens `/etc` using ambient authority. For more control,
+/// use [`read_subid_mappings_with_etc`] with an [`EtcDir`] handle.
+pub fn read_subid_mappings(
+    username: Option<&str>,
+) -> Result<(Vec<IdMap>, Vec<IdMap>), UsernsError> {
+    let etc_dir = EtcDir::open_system()?;
+    read_subid_mappings_with_etc(&etc_dir, username)
 }
 
 /// Check if unprivileged user namespaces are enabled.
