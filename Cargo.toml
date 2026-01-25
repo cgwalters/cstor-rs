@@ -1,9 +1,26 @@
-[package]
-name = "cstor-rs"
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.lints.rust]
+# Require an extra opt-in for unsafe
+unsafe_code = "deny"
+# Absolutely must handle errors
+unused_must_use = "forbid"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+# Feel free to comment this one out locally during development of a patch.
+dead_code = "deny"
+
+[workspace.dependencies]
+# Internal crates
+cstor-rs = { path = "crates/cstor-rs" }
+
+# Core dependencies
 cap-std = "3.0"
 cap-std-ext = "4.0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -29,24 +46,11 @@ tracing = "0.1"
 tokio = { version = "1.40", features = ["full"] }
 jsonrpc-fdpass = { git = "https://github.com/cgwalters/jsonrpc-fdpass", rev = "c8b4aa54afa433541d83f1cb5436b44842a21e68" }
 
-[dev-dependencies]
+# Dev/test dependencies
 tempfile = "3.0"
 xshell = "0.2"
-
-[[bin]]
-name = "cstor-rs"
-path = "src/bin/cli/main.rs"
-
-[[bin]]
-name = "tar-diff"
-path = "src/bin/tar-diff.rs"
-
-[lints.rust]
-# Require an extra opt-in for unsafe
-unsafe_code = "deny"
-# Absolutely must handle errors
-unused_must_use = "forbid"
-missing_docs = "deny"
-missing_debug_implementations = "deny"
-# Feel free to comment this one out locally during development of a patch.
-dead_code = "deny"
+color-eyre = "0.6"
+linkme = "0.3"
+paste = "1.0"
+libtest-mimic = "0.8"
+uuid = { version = "1", features = ["v4"] }

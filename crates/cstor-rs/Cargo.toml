@@ -1,0 +1,45 @@
+[package]
+name = "cstor-rs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cap-std.workspace = true
+cap-std-ext.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+flate2.workspace = true
+clap.workspace = true
+tar.workspace = true
+base64.workspace = true
+crc.workspace = true
+sha2.workspace = true
+oci-spec.workspace = true
+ocidir.workspace = true
+camino.workspace = true
+rustix.workspace = true
+comfy-table.workspace = true
+facet.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+jsonrpc-fdpass.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+xshell.workspace = true
+
+[[bin]]
+name = "cstor-rs"
+path = "src/bin/cli/main.rs"
+
+[[bin]]
+name = "tar-diff"
+path = "src/bin/tar-diff.rs"
+
+[lints]
+workspace = true
