@@ -193,6 +193,10 @@ enum LayerCommands {
 }
 
 fn main() -> Result<()> {
+    // Check if this process was spawned as a userns helper and run the helper loop if so.
+    // This must be called early, before any other processing.
+    cstor_rs::userns_helper::init_if_helper();
+
     let cli = Cli::parse();
 
     // Re-exec via podman unshare if needed for proper UID/GID mapping

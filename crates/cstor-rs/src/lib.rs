@@ -105,6 +105,11 @@ mod readatreader;
 pub mod userns;
 pub mod userns_helper;
 
+// Re-export userns_helper types for convenient access
+pub use userns_helper::{
+    ImageInfo, ProxiedStorage, ProxiedTarSplitItem, StorageProxy, init_if_helper,
+};
+
 // Re-export commonly used types
 pub use config::{AdditionalLayerStore, StorageConfig};
 pub use error::{Result, StorageError};
