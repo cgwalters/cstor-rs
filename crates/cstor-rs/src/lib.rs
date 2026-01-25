@@ -88,8 +88,9 @@ pub mod tar_split_writer;
 pub mod tar_writer;
 pub mod toc;
 
-// Layer creation
+// Layer creation and management
 pub mod layer_builder;
+pub mod layer_store;
 
 // Layer extraction
 pub mod extract;
@@ -133,8 +134,9 @@ pub use tar_split::{
 pub use tar_writer::{write_file_data, write_tar_footer, write_tar_header};
 pub use toc::{Toc, TocEntry, TocEntryType};
 
-// Layer creation exports
+// Layer creation and management exports
 pub use layer_builder::LayerBuilder;
+pub use layer_store::{IdMapping, LayerRecord, LayerStore, generate_layer_id, generate_link_id};
 pub use tar_split_writer::TarSplitWriter;
 
 // Layer extraction exports
