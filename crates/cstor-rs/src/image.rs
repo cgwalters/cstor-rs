@@ -164,7 +164,7 @@ impl Image {
     /// # Ok::<(), cstor_rs::StorageError>(())
     /// ```
     pub fn config(&self) -> Result<ImageConfiguration> {
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD};
 
         // The config is stored with key: sha256:<image-id>
         // Base64 encode: "sha256:<id>"

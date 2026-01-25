@@ -42,9 +42,9 @@
 use std::io::{Read, Write};
 
 use base64::prelude::*;
-use crc::{Crc, CRC_64_GO_ISO};
-use flate2::write::GzEncoder;
+use crc::{CRC_64_GO_ISO, Crc};
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use serde::Serialize;
 
 use crate::error::{Result, StorageError};
@@ -327,11 +327,7 @@ fn is_leap_year(year: i64) -> bool {
 fn days_before_month(month: i64, leap: bool) -> i64 {
     const DAYS: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
     let d = DAYS.get((month - 1) as usize).copied().unwrap_or(0);
-    if leap && month > 2 {
-        d + 1
-    } else {
-        d
-    }
+    if leap && month > 2 { d + 1 } else { d }
 }
 
 /// Serialize a TarHeader to a 512-byte block.

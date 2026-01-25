@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 /// Test image name to use for comparison tests
 const TEST_IMAGE: &str = "busybox";
@@ -968,7 +968,7 @@ fn test_toc_matches_tar() -> Result<()> {
 fn test_splitfdstream_roundtrip() -> Result<()> {
     use cstor_rs::splitfdstream::reconstruct_tar_seekable;
     use cstor_rs::{
-        layer_to_splitfdstream, Storage, TarSplitFdStream, TarSplitItem, DEFAULT_INLINE_THRESHOLD,
+        DEFAULT_INLINE_THRESHOLD, Storage, TarSplitFdStream, TarSplitItem, layer_to_splitfdstream,
     };
     use std::io::{Read, Write};
 

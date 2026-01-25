@@ -37,12 +37,12 @@
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::io::{AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
-use rustix::fs::{ioctl_ficlone, Mode};
+use rustix::fs::{Mode, ioctl_ficlone};
 
 use crate::error::{Result, StorageError};
 use crate::storage::Storage;
