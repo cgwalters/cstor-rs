@@ -22,6 +22,7 @@ oci-spec.workspace = true
 ocidir.workspace = true
 camino.workspace = true
 rustix.workspace = true
+rustix-linux-procfs.workspace = true
 comfy-table.workspace = true
 facet.workspace = true
 chrono.workspace = true

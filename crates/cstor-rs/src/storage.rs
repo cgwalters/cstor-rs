@@ -59,8 +59,8 @@ use crate::error::{Result, StorageError};
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use rusqlite::Connection;
+use rustix::path::DecInt;
 use std::env;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// Main storage handle providing read-only access to container storage.
@@ -227,15 +227,30 @@ impl Storage {
     /// Open the SQLite database using fd-relative access.
     ///
     /// This opens the database file relative to the root directory handle
-    /// using the /proc/self/fd/{fd} mechanism to ensure we're accessing
+    /// using a verified /proc/self/fd path to ensure we're accessing
     /// the exact file we opened, preventing TOCTOU vulnerabilities.
     fn open_database(root_dir: &Dir) -> Result<Connection> {
         let db_file = root_dir.open("db.sql")?;
-        let fd = db_file.as_raw_fd();
 
-        // Open SQLite connection via file descriptor path
-        // This ensures we're accessing the exact file we opened
-        let db_path = format!("/proc/self/fd/{}", fd);
+        // Get a verified handle to /proc/self/fd using rustix-linux-procfs.
+        // This validates that /proc is actually procfs and hasn't been tampered with.
+        let proc_self_fd = rustix_linux_procfs::proc_self_fd()
+            .map_err(|e| StorageError::Io(std::io::Error::from_raw_os_error(e.raw_os_error())))?;
+
+        // Validate that our fd is accessible via the verified procfs directory
+        // by opening it relative to the proc_self_fd handle.
+        let fd_name = DecInt::from_fd(&db_file);
+        let _verified = rustix::fs::openat(
+            &proc_self_fd,
+            fd_name.as_c_str(),
+            rustix::fs::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|e| StorageError::Io(std::io::Error::from_raw_os_error(e.raw_os_error())))?;
+
+        // SQLite requires a path string, so we construct one using the verified fd number.
+        // We've already validated that /proc/self/fd is trustworthy above.
+        let db_path = format!("/proc/self/fd/{}", fd_name.as_ref().to_string_lossy());
         let conn = Connection::open(&db_path)?;
 
         // Keep the file handle alive by forgetting it

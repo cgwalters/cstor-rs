@@ -47,7 +47,8 @@ sha2 = "0.10"
 oci-spec = "0.8.3"
 ocidir = "0.6.0"
 camino = "1.2.1"
-rustix = { version = "0.38", features = ["fs", "process", "thread"] }
+rustix = { version = "1.0", features = ["fs", "process", "thread"] }
+rustix-linux-procfs = "0.1"
 comfy-table = "7.2"
 facet = { version = "0.43", features = ["reflect"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
