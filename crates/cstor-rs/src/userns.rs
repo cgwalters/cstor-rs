@@ -77,7 +77,7 @@ use std::path::Path;
 use std::process::Command;
 
 use rustix::process::{getgid, getuid};
-use rustix::thread::{capabilities, CapabilityFlags};
+use rustix::thread::{CapabilitySet, capabilities};
 use thiserror::Error;
 
 /// Errors that can occur during user namespace operations.
@@ -182,7 +182,7 @@ pub fn can_bypass_file_permissions() -> bool {
 
     // Check for CAP_DAC_OVERRIDE capability
     if let Ok(caps) = capabilities(None) {
-        if caps.effective.contains(CapabilityFlags::DAC_OVERRIDE) {
+        if caps.effective.contains(CapabilitySet::DAC_OVERRIDE) {
             return true;
         }
     }
