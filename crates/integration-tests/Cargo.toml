@@ -1,0 +1,33 @@
+[package]
+name = "integration-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "integration-tests"
+path = "src/main.rs"
+
+[dependencies]
+cstor-rs.workspace = true
+
+# Test infrastructure
+linkme.workspace = true
+libtest-mimic.workspace = true
+paste.workspace = true
+color-eyre.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
+
+# For test utilities
+cap-std.workspace = true
+rustix.workspace = true
+rusqlite.workspace = true
+
+[lints.rust]
+# linkme requires unsafe
+unsafe_code = "allow"
+# Tests may have incomplete implementations during development
+dead_code = "allow"
+missing_docs = "allow"
+missing_debug_implementations = "allow"
