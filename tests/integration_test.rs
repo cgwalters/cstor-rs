@@ -8,52 +8,38 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use tempfile::TempDir;
+use xshell::{cmd, Shell};
 
 /// Test image name to use for comparison tests
 const TEST_IMAGE: &str = "busybox";
 
+/// Create a new xshell Shell instance
+fn shell() -> Result<Shell> {
+    Shell::new().context("Failed to create xshell Shell")
+}
+
 /// Ensure test image exists in containers-storage
 fn ensure_test_image() -> Result<()> {
-    let output = Command::new("podman")
-        .args(&["images", "-q", TEST_IMAGE])
-        .output()
-        .context("Failed to check if test image exists")?;
+    let sh = shell()?;
+    let output = cmd!(sh, "podman images -q {TEST_IMAGE}")
+        .ignore_status()
+        .output()?;
 
     if output.stdout.is_empty() {
         eprintln!("Pulling test image: {}", TEST_IMAGE);
-        let status = Command::new("podman")
-            .args(&["pull", TEST_IMAGE])
-            .status()
-            .context("Failed to pull test image")?;
-
-        if !status.success() {
-            anyhow::bail!("Failed to pull test image");
-        }
+        cmd!(sh, "podman pull {TEST_IMAGE}").run()?;
     }
 
     Ok(())
 }
 
 /// Get the full image ID for an image name
-fn get_image_id(image_name: &str) -> Result<String> {
-    let output = Command::new("podman")
-        .args(&["images", "-q", "--no-trunc", image_name])
-        .output()
-        .context("Failed to get image ID")?;
-
-    if !output.status.success() {
-        anyhow::bail!("Failed to get image ID");
-    }
-
-    let id = String::from_utf8(output.stdout)
-        .context("Invalid UTF-8 in image ID")?
-        .trim()
-        .to_string();
-
+fn get_image_id(sh: &Shell, image_name: &str) -> Result<String> {
+    let output = cmd!(sh, "podman images -q --no-trunc {image_name}").read()?;
+    let id = output.trim();
     // Strip "sha256:" prefix if present
-    Ok(id.strip_prefix("sha256:").unwrap_or(&id).to_string())
+    Ok(id.strip_prefix("sha256:").unwrap_or(id).to_string())
 }
 
 /// Calculate SHA256 hash of all blobs in an OCI directory
@@ -84,11 +70,13 @@ fn hash_oci_blobs(oci_dir: &Path) -> Result<Vec<(String, String)>> {
 #[test]
 #[ignore] // Requires skopeo, podman, and test image
 fn test_compare_with_skopeo() -> Result<()> {
+    let sh = shell()?;
+
     // Ensure test image exists
     ensure_test_image().context("Failed to ensure test image")?;
 
     // Get image ID
-    let image_id = get_image_id(TEST_IMAGE).context("Failed to get image ID")?;
+    let image_id = get_image_id(&sh, TEST_IMAGE).context("Failed to get image ID")?;
 
     println!("Testing with image: {} ({})", TEST_IMAGE, image_id);
 
@@ -96,38 +84,20 @@ fn test_compare_with_skopeo() -> Result<()> {
     let temp_dir = TempDir::new().context("Failed to create temp dir")?;
     let skopeo_dir = temp_dir.path().join("skopeo-oci");
     let overlay_dir = temp_dir.path().join("overlay-oci");
+    let skopeo_dir_str = skopeo_dir.display().to_string();
+    let overlay_dir_str = overlay_dir.display().to_string();
 
     println!("\nCopying with skopeo...");
-    let skopeo_status = Command::new("skopeo")
-        .args(&[
-            "copy",
-            &format!("containers-storage:{}", TEST_IMAGE),
-            &format!("oci:{}", skopeo_dir.display()),
-        ])
-        .status()
-        .context("Failed to run skopeo")?;
-
-    if !skopeo_status.success() {
-        anyhow::bail!("skopeo copy failed");
-    }
+    let skopeo_src = format!("containers-storage:{}", TEST_IMAGE);
+    let skopeo_dest = format!("oci:{}", skopeo_dir_str);
+    cmd!(sh, "skopeo copy {skopeo_src} {skopeo_dest}").run()?;
 
     println!("Copying with cstor-rs...");
-    let overlay_status = Command::new("cargo")
-        .args(&[
-            "run",
-            "--bin",
-            "cstor-rs",
-            "--",
-            "copy-to-oci",
-            &image_id,
-            overlay_dir.to_str().unwrap(),
-        ])
-        .status()
-        .context("Failed to run cstor-rs")?;
-
-    if !overlay_status.success() {
-        anyhow::bail!("cstor-rs copy-to-oci failed");
-    }
+    cmd!(
+        sh,
+        "cargo run --bin cstor-rs -- image copy-to-oci {image_id} {overlay_dir_str}"
+    )
+    .run()?;
 
     println!("\nComparing outputs...");
 
@@ -146,7 +116,6 @@ fn test_compare_with_skopeo() -> Result<()> {
     }
 
     // Find layer blobs (exclude config which is the image ID)
-    // Both tools export uncompressed tar layers from containers-storage
     let skopeo_layers: Vec<_> = skopeo_hashes
         .iter()
         .filter(|(name, _)| name.as_str() != image_id)
@@ -160,7 +129,7 @@ fn test_compare_with_skopeo() -> Result<()> {
     println!("  Note: Both tools export uncompressed tar layers");
 
     // Compare layer blob digests directly - both are uncompressed tar
-    for (i, (sk_name, _sk_hash)) in skopeo_layers.iter().enumerate() {
+    for (sk_name, _sk_hash) in skopeo_layers.iter() {
         let sk_path = skopeo_dir.join("blobs/sha256").join(sk_name);
         let sk_data = fs::read(&sk_path)?;
 
@@ -174,8 +143,7 @@ fn test_compare_with_skopeo() -> Result<()> {
         }
 
         println!(
-            "  Skopeo layer {}: {} bytes, digest = {}",
-            i + 1,
+            "  Skopeo layer: {} bytes, digest = {}",
             sk_data.len(),
             sk_name
         );
@@ -192,14 +160,12 @@ fn test_compare_with_skopeo() -> Result<()> {
             }
 
             println!(
-                "    cstor-rs blob {}: {} bytes, digest = {}",
-                ov_name,
+                "    cstor-rs blob: {} bytes, digest = {}",
                 ov_data.len(),
                 ov_name
             );
 
-            // Since both are uncompressed tar, compare blob digests directly
-            if sk_name == ov_name {
+            if *sk_name == **ov_name {
                 println!("  Found matching blob digest");
                 found = true;
                 break;
@@ -219,28 +185,20 @@ fn test_compare_with_skopeo() -> Result<()> {
 #[test]
 #[ignore] // Requires podman and test image
 fn test_layer_export() -> Result<()> {
+    let sh = shell()?;
+
     ensure_test_image().context("Failed to ensure test image")?;
 
-    let image_id = get_image_id(TEST_IMAGE).context("Failed to get image ID")?;
+    let image_id = get_image_id(&sh, TEST_IMAGE).context("Failed to get image ID")?;
 
     println!("Testing layer export for image: {}", image_id);
 
     // Get first layer ID using cstor-rs
-    let output = Command::new("cargo")
-        .args(&["run", "--bin", "cstor-rs", "--", "list-layers", &image_id])
-        .output()
-        .context("Failed to list layers")?;
+    let output = cmd!(sh, "cargo run --bin cstor-rs -- image layers {image_id}").read()?;
+    println!("Layers output:\n{}", output);
 
-    if !output.status.success() {
-        anyhow::bail!("Failed to list layers");
-    }
-
-    let output_str = String::from_utf8(output.stdout)?;
-    println!("Layers output:\n{}", output_str);
-
-    // Extract first layer ID from output
-    // Format: "  Layer 1: <layer-id>"
-    let layer_id = output_str
+    // Extract first layer ID from output (format: "  Layer 1: <layer-id>")
+    let layer_id = output
         .lines()
         .find(|line| line.contains("Layer 1:"))
         .and_then(|line| line.split(':').nth(1))
@@ -252,24 +210,13 @@ fn test_layer_export() -> Result<()> {
     // Export layer to temp file
     let temp_dir = TempDir::new()?;
     let tar_path = temp_dir.path().join("layer.tar");
+    let tar_path_str = tar_path.display().to_string();
 
-    let export_status = Command::new("cargo")
-        .args(&[
-            "run",
-            "--bin",
-            "cstor-rs",
-            "--",
-            "export-layer",
-            layer_id,
-            "-o",
-            tar_path.to_str().unwrap(),
-        ])
-        .status()
-        .context("Failed to export layer")?;
-
-    if !export_status.success() {
-        anyhow::bail!("Layer export failed");
-    }
+    cmd!(
+        sh,
+        "cargo run --bin cstor-rs -- layer export {layer_id} -o {tar_path_str}"
+    )
+    .run()?;
 
     // Verify tar file exists and has content
     let metadata = fs::metadata(&tar_path).context("Failed to get tar file metadata")?;
@@ -278,13 +225,12 @@ fn test_layer_export() -> Result<()> {
     assert!(metadata.len() > 0, "Tar file is empty");
 
     // Try to list contents with tar command
-    let tar_list = Command::new("tar")
-        .args(&["-tf", tar_path.to_str().unwrap()])
-        .output()
-        .context("Failed to list tar contents")?;
+    let tar_output = cmd!(sh, "tar -tf {tar_path_str}")
+        .ignore_status()
+        .output()?;
 
-    if tar_list.status.success() {
-        let contents = String::from_utf8_lossy(&tar_list.stdout);
+    if tar_output.status.success() {
+        let contents = String::from_utf8_lossy(&tar_output.stdout);
         let file_count = contents.lines().count();
         println!("Tar contains {} entries", file_count);
         assert!(file_count > 0, "Tar has no entries");
@@ -300,26 +246,19 @@ fn test_layer_export() -> Result<()> {
 }
 
 /// Check if a command exists in PATH
-fn command_exists(cmd: &str) -> bool {
-    Command::new("which")
-        .arg(cmd)
+fn command_exists(sh: &Shell, cmd_name: &str) -> bool {
+    cmd!(sh, "which {cmd_name}")
+        .ignore_status()
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
 /// List all available images in containers-storage
-fn list_available_images() -> Result<Vec<String>> {
-    let output = Command::new("podman")
-        .args(&["images", "-q", "--no-trunc"])
-        .output()
-        .context("Failed to list images")?;
+fn list_available_images(sh: &Shell) -> Result<Vec<String>> {
+    let output = cmd!(sh, "podman images -q --no-trunc").read()?;
 
-    if !output.status.success() {
-        anyhow::bail!("Failed to list images");
-    }
-
-    let images: Vec<String> = String::from_utf8(output.stdout)?
+    let images: Vec<String> = output
         .lines()
         .map(|line| {
             line.trim()
@@ -362,37 +301,19 @@ fn read_oci_blob(oci_dir: &Path, digest: &str) -> Result<Vec<u8>> {
 }
 
 /// Integration test to verify cstor-rs copy-to-oci produces identical output to skopeo.
-///
-/// This test:
-/// 1. Checks that skopeo is installed (skips if not)
-/// 2. Lists images in containers-storage (skips if none found)
-/// 3. Exports an image using both cstor-rs and skopeo to OCI directories
-/// 4. Compares the outputs:
-///    - Config blob digests and content
-///    - Layer count
-///    - Layer blob digests (both tools export uncompressed tar)
-///    - Manifest structure and metadata
-///
-/// Note: Both cstor-rs and skopeo export uncompressed tar layers when copying
-/// from containers-storage, so blob digests should match exactly.
-///
-/// Note: This test is marked with #[ignore] and requires:
-/// - containers-storage with at least one complete image
-/// - skopeo installed and in PATH
-/// - cstor-rs binary built (test builds it automatically)
-///
-/// Run with: cargo test test_copy_to_oci_matches_skopeo -- --ignored
 #[test]
 #[ignore] // Requires containers-storage with images, skopeo, and cstor-rs binary
 fn test_copy_to_oci_matches_skopeo() -> Result<()> {
+    let sh = shell()?;
+
     // Check prerequisites
-    if !command_exists("skopeo") {
+    if !command_exists(&sh, "skopeo") {
         eprintln!("Skipping test: skopeo is not installed");
         return Ok(());
     }
 
     // List available images
-    let images = list_available_images().context("Failed to list available images")?;
+    let images = list_available_images(&sh).context("Failed to list available images")?;
 
     if images.is_empty() {
         eprintln!("Skipping test: no images found in containers-storage");
@@ -408,47 +329,32 @@ fn test_copy_to_oci_matches_skopeo() -> Result<()> {
 
     // Build cstor-rs binary first
     println!("\nBuilding cstor-rs binary...");
-    let build_status = Command::new("cargo")
-        .args(&["build", "--bin", "cstor-rs", "--quiet"])
-        .status()
-        .context("Failed to build cstor-rs")?;
-
-    if !build_status.success() {
-        anyhow::bail!(
-            "Failed to build cstor-rs binary. Run 'cargo build --bin cstor-rs' to see errors."
-        );
-    }
+    cmd!(sh, "cargo build --bin cstor-rs --quiet").run()?;
 
     // Create temporary directories
     let temp_dir = TempDir::new().context("Failed to create temp dir")?;
     let cstor_dir = temp_dir.path().join("cstor-oci");
     let skopeo_dir = temp_dir.path().join("skopeo-oci");
+    let cstor_dir_str = cstor_dir.display().to_string();
+    let skopeo_dir_str = skopeo_dir.display().to_string();
 
     println!("Temporary directories:");
-    println!("  cstor-rs: {}", cstor_dir.display());
-    println!("  skopeo:   {}", skopeo_dir.display());
+    println!("  cstor-rs: {}", cstor_dir_str);
+    println!("  skopeo:   {}", skopeo_dir_str);
 
     // Export with cstor-rs copy-to-oci
     println!("\nExporting with cstor-rs copy-to-oci...");
-    let cstor_output = Command::new("cargo")
-        .args(&[
-            "run",
-            "--bin",
-            "cstor-rs",
-            "--quiet",
-            "--",
-            "copy-to-oci",
-            image_id,
-            cstor_dir.to_str().unwrap(),
-        ])
-        .output()
-        .context("Failed to run cstor-rs")?;
+    let cstor_output = cmd!(
+        sh,
+        "cargo run --bin cstor-rs --quiet -- image copy-to-oci {image_id} {cstor_dir_str}"
+    )
+    .ignore_status()
+    .output()?;
 
     if !cstor_output.status.success() {
         let stderr = String::from_utf8_lossy(&cstor_output.stderr);
         let stdout = String::from_utf8_lossy(&cstor_output.stdout);
         eprintln!("Skipping test: cstor-rs failed for image {}", image_id);
-        eprintln!("This might indicate incomplete or corrupted image data.");
         eprintln!("stdout: {}", stdout);
         eprintln!("stderr: {}", stderr);
         return Ok(());
@@ -456,18 +362,9 @@ fn test_copy_to_oci_matches_skopeo() -> Result<()> {
 
     // Export with skopeo
     println!("Exporting with skopeo...");
-    let skopeo_status = Command::new("skopeo")
-        .args(&[
-            "copy",
-            &format!("containers-storage:{}", image_id),
-            &format!("oci:{}", skopeo_dir.display()),
-        ])
-        .status()
-        .context("Failed to run skopeo")?;
-
-    if !skopeo_status.success() {
-        anyhow::bail!("skopeo copy failed");
-    }
+    let skopeo_src = format!("containers-storage:{}", image_id);
+    let skopeo_dest = format!("oci:{}", skopeo_dir_str);
+    cmd!(sh, "skopeo copy {skopeo_src} {skopeo_dest}").run()?;
 
     println!("\nComparing outputs...");
 
@@ -520,7 +417,7 @@ fn test_copy_to_oci_matches_skopeo() -> Result<()> {
         );
     }
 
-    // Compare each layer: both tools export uncompressed tar, so digests should match exactly
+    // Compare each layer
     for (i, (cstor_layer, skopeo_layer)) in
         cstor_layers.iter().zip(skopeo_layers.iter()).enumerate()
     {
@@ -531,7 +428,6 @@ fn test_copy_to_oci_matches_skopeo() -> Result<()> {
         println!("    cstor-rs digest: {}", cstor_digest);
         println!("    skopeo digest:   {}", skopeo_digest);
 
-        // Since both export uncompressed tar, digests should match exactly
         if cstor_digest != skopeo_digest {
             anyhow::bail!(
                 "Layer {} digest mismatch:\n  cstor-rs: {}\n  skopeo:   {}",
@@ -591,31 +487,21 @@ fn test_copy_to_oci_matches_skopeo() -> Result<()> {
 }
 
 #[test]
-fn test_binary_builds() {
-    // Just verify the binary compiles
-    let status = Command::new("cargo")
-        .args(&["build", "--bin", "cstor-rs"])
-        .status()
-        .expect("Failed to build binary");
-
-    assert!(status.success(), "Binary failed to build");
+fn test_binary_builds() -> Result<()> {
+    let sh = shell()?;
+    cmd!(sh, "cargo build --bin cstor-rs").run()?;
+    Ok(())
 }
 
 /// Test that reflink-to-dir extracts an image correctly.
-///
-/// This test:
-/// 1. Ensures busybox image exists in containers-storage
-/// 2. Extracts the image using `cstor-rs reflink-to-dir --force-copy`
-/// 3. Verifies expected files exist in the output
-/// 4. Compares file list with `podman export` of a container
-///
-/// Note: Uses --force-copy since the test environment may not support reflinks.
 #[test]
 #[ignore] // Requires podman and test image
 fn test_reflink_to_dir() -> Result<()> {
+    let sh = shell()?;
+
     ensure_test_image().context("Failed to ensure test image")?;
 
-    let image_id = get_image_id(TEST_IMAGE).context("Failed to get image ID")?;
+    let image_id = get_image_id(&sh, TEST_IMAGE).context("Failed to get image ID")?;
     println!(
         "Testing reflink-to-dir with image: {} ({})",
         TEST_IMAGE, image_id
@@ -624,21 +510,15 @@ fn test_reflink_to_dir() -> Result<()> {
     // Create temporary directory for output
     let temp_dir = TempDir::new().context("Failed to create temp dir")?;
     let output_dir = temp_dir.path().join("extracted");
+    let output_dir_str = output_dir.display().to_string();
 
     println!("\nExtracting with cstor-rs reflink-to-dir...");
-    let extract_output = Command::new("cargo")
-        .args(&[
-            "run",
-            "--bin",
-            "cstor-rs",
-            "--",
-            "reflink-to-dir",
-            &image_id,
-            output_dir.to_str().unwrap(),
-            "--force-copy",
-        ])
-        .output()
-        .context("Failed to run cstor-rs reflink-to-dir")?;
+    let extract_output = cmd!(
+        sh,
+        "cargo run --bin cstor-rs -- image extract {image_id} {output_dir_str} --force-copy"
+    )
+    .ignore_status()
+    .output()?;
 
     if !extract_output.status.success() {
         let stderr = String::from_utf8_lossy(&extract_output.stderr);
@@ -656,20 +536,11 @@ fn test_reflink_to_dir() -> Result<()> {
     assert!(output_dir.exists(), "Output directory should exist");
 
     // List files in the extracted directory (need to use podman unshare for rootless)
-    let ls_output = Command::new("podman")
-        .args(&[
-            "unshare",
-            "find",
-            output_dir.to_str().unwrap(),
-            "-maxdepth",
-            "2",
-            "-type",
-            "f",
-        ])
-        .output()
-        .context("Failed to list extracted files")?;
-
-    let files_list = String::from_utf8_lossy(&ls_output.stdout);
+    let files_list = cmd!(
+        sh,
+        "podman unshare find {output_dir_str} -maxdepth 2 -type f"
+    )
+    .read()?;
     let file_count = files_list.lines().count();
     println!(
         "Found {} files in extracted directory (depth 2)",
@@ -680,12 +551,7 @@ fn test_reflink_to_dir() -> Result<()> {
     assert!(file_count > 0, "Extracted directory should contain files");
 
     // Check for expected busybox structure
-    let check_output = Command::new("podman")
-        .args(&["unshare", "ls", "-la", output_dir.to_str().unwrap()])
-        .output()
-        .context("Failed to check extracted directory")?;
-
-    let dir_listing = String::from_utf8_lossy(&check_output.stdout);
+    let dir_listing = cmd!(sh, "podman unshare ls -la {output_dir_str}").read()?;
     println!("\nExtracted directory contents:\n{}", dir_listing);
 
     // busybox should have bin/ or usr/ directory
@@ -698,69 +564,32 @@ fn test_reflink_to_dir() -> Result<()> {
     // Compare with podman export
     println!("\nComparing with podman export...");
     let podman_tar = temp_dir.path().join("podman-export.tar");
+    let podman_tar_str = podman_tar.display().to_string();
 
     // Create a container from the image and export it
-    let create_output = Command::new("podman")
-        .args(&["create", "--name", "cstor-test-container", TEST_IMAGE])
-        .output()
-        .context("Failed to create container")?;
-
-    if !create_output.status.success() {
-        // Container might already exist, try to remove and recreate
-        let _ = Command::new("podman")
-            .args(&["rm", "-f", "cstor-test-container"])
-            .status();
-        Command::new("podman")
-            .args(&["create", "--name", "cstor-test-container", TEST_IMAGE])
-            .status()
-            .context("Failed to create container")?;
-    }
-
-    let export_status = Command::new("podman")
-        .args(&[
-            "export",
-            "cstor-test-container",
-            "-o",
-            podman_tar.to_str().unwrap(),
-        ])
-        .status()
-        .context("Failed to export container")?;
-
-    // Clean up container
-    let _ = Command::new("podman")
-        .args(&["rm", "-f", "cstor-test-container"])
-        .status();
-
-    if !export_status.success() {
-        anyhow::bail!("podman export failed");
-    }
+    let container_name = "cstor-test-container";
+    let _ = cmd!(sh, "podman rm -f {container_name}")
+        .ignore_status()
+        .output();
+    cmd!(sh, "podman create --name {container_name} {TEST_IMAGE}").run()?;
+    cmd!(sh, "podman export {container_name} -o {podman_tar_str}").run()?;
+    let _ = cmd!(sh, "podman rm -f {container_name}")
+        .ignore_status()
+        .output();
 
     // List files in podman export
-    let podman_list = Command::new("tar")
-        .args(&["-tf", podman_tar.to_str().unwrap()])
-        .output()
-        .context("Failed to list podman export")?;
+    let podman_list = cmd!(sh, "tar -tf {podman_tar_str}").read()?;
 
-    let podman_files: std::collections::HashSet<String> =
-        String::from_utf8_lossy(&podman_list.stdout)
-            .lines()
-            .map(|s| s.trim_end_matches('/').to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+    let podman_files: std::collections::HashSet<String> = podman_list
+        .lines()
+        .map(|s| s.trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     // List files in our extraction
-    let our_list = Command::new("podman")
-        .args(&[
-            "unshare",
-            "find",
-            output_dir.to_str().unwrap(),
-            "-printf",
-            "%P\n",
-        ])
-        .output()
-        .context("Failed to list our extraction")?;
+    let our_list = cmd!(sh, "podman unshare find {output_dir_str} -printf %P\\n").read()?;
 
-    let our_files: std::collections::HashSet<String> = String::from_utf8_lossy(&our_list.stdout)
+    let our_files: std::collections::HashSet<String> = our_list
         .lines()
         .map(|s| s.trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty())
@@ -807,37 +636,25 @@ fn test_reflink_to_dir() -> Result<()> {
 }
 
 /// Test that the TOC command outputs valid JSON with expected structure.
-///
-/// This test:
-/// 1. Ensures busybox image exists in containers-storage
-/// 2. Runs `cstor-rs toc` to generate TOC JSON
-/// 3. Parses the JSON and verifies structure
-/// 4. Checks for expected busybox files in the TOC
 #[test]
 #[ignore] // Requires podman and test image
 fn test_toc_output() -> Result<()> {
+    let sh = shell()?;
+
     ensure_test_image().context("Failed to ensure test image")?;
 
-    let image_id = get_image_id(TEST_IMAGE).context("Failed to get image ID")?;
+    let image_id = get_image_id(&sh, TEST_IMAGE).context("Failed to get image ID")?;
     println!(
         "Testing TOC output for image: {} ({})",
         TEST_IMAGE, image_id
     );
 
     // Run cstor-rs toc command
-    let toc_output = Command::new("cargo")
-        .args(&[
-            "run", "--bin", "cstor-rs", "--quiet", "--", "toc", &image_id,
-        ])
-        .output()
-        .context("Failed to run cstor-rs toc")?;
-
-    if !toc_output.status.success() {
-        let stderr = String::from_utf8_lossy(&toc_output.stderr);
-        anyhow::bail!("toc command failed: {}", stderr);
-    }
-
-    let toc_json = String::from_utf8(toc_output.stdout).context("TOC output is not valid UTF-8")?;
+    let toc_json = cmd!(
+        sh,
+        "cargo run --bin cstor-rs --quiet -- image toc {image_id}"
+    )
+    .read()?;
 
     // Parse the JSON
     let toc: serde_json::Value =
@@ -943,45 +760,27 @@ fn test_toc_output() -> Result<()> {
 }
 
 /// Test that IPC export produces identical output to direct export.
-///
-/// This test:
-/// 1. Ensures busybox image exists in containers-storage
-/// 2. Exports a layer using both export-layer and export-layer-ipc commands
-/// 3. Compares the resulting tar files byte-for-byte
-///
-/// This validates that the NDJSON-RPC-FD protocol with fd passing
-/// correctly reconstructs the tar stream.
 #[test]
 #[ignore] // Requires podman and test image
 fn test_ipc_export_matches_direct() -> Result<()> {
+    let sh = shell()?;
+
     ensure_test_image().context("Failed to ensure test image")?;
 
-    let image_id = get_image_id(TEST_IMAGE).context("Failed to get image ID")?;
+    let image_id = get_image_id(&sh, TEST_IMAGE).context("Failed to get image ID")?;
     println!(
         "Testing IPC export for image: {} ({})",
         TEST_IMAGE, image_id
     );
 
     // Get first layer ID using cstor-rs
-    let output = Command::new("cargo")
-        .args(&[
-            "run",
-            "--bin",
-            "cstor-rs",
-            "--quiet",
-            "--",
-            "list-layers",
-            &image_id,
-        ])
-        .output()
-        .context("Failed to list layers")?;
+    let output = cmd!(
+        sh,
+        "cargo run --bin cstor-rs --quiet -- image layers {image_id}"
+    )
+    .read()?;
 
-    if !output.status.success() {
-        anyhow::bail!("Failed to list layers");
-    }
-
-    let output_str = String::from_utf8(output.stdout)?;
-    let layer_id = output_str
+    let layer_id = output
         .lines()
         .find(|line| line.contains("Layer 1:"))
         .and_then(|line| line.split(':').nth(1))
@@ -994,48 +793,24 @@ fn test_ipc_export_matches_direct() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let direct_tar = temp_dir.path().join("direct.tar");
     let ipc_tar = temp_dir.path().join("ipc.tar");
+    let direct_tar_str = direct_tar.display().to_string();
+    let ipc_tar_str = ipc_tar.display().to_string();
 
     // Export layer directly
     println!("\nExporting layer directly...");
-    let direct_status = Command::new("cargo")
-        .args(&[
-            "run",
-            "--bin",
-            "cstor-rs",
-            "--quiet",
-            "--",
-            "export-layer",
-            layer_id,
-            "-o",
-            direct_tar.to_str().unwrap(),
-        ])
-        .status()
-        .context("Failed to export layer directly")?;
-
-    if !direct_status.success() {
-        anyhow::bail!("Direct export failed");
-    }
+    cmd!(
+        sh,
+        "cargo run --bin cstor-rs --quiet -- layer export {layer_id} -o {direct_tar_str}"
+    )
+    .run()?;
 
     // Export layer via IPC
     println!("Exporting layer via IPC...");
-    let ipc_status = Command::new("cargo")
-        .args(&[
-            "run",
-            "--bin",
-            "cstor-rs",
-            "--quiet",
-            "--",
-            "export-layer-ipc",
-            layer_id,
-            "-o",
-            ipc_tar.to_str().unwrap(),
-        ])
-        .status()
-        .context("Failed to export layer via IPC")?;
-
-    if !ipc_status.success() {
-        anyhow::bail!("IPC export failed");
-    }
+    cmd!(
+        sh,
+        "cargo run --bin cstor-rs --quiet -- layer export-ipc {layer_id} -o {ipc_tar_str}"
+    )
+    .run()?;
 
     // Compare file sizes
     let direct_meta = fs::metadata(&direct_tar).context("Failed to get direct tar metadata")?;
@@ -1083,36 +858,27 @@ fn test_ipc_export_matches_direct() -> Result<()> {
 }
 
 /// Test that TOC entries match tar listing.
-///
-/// This test:
-/// 1. Exports a layer using cstor-rs export-layer
-/// 2. Gets TOC for the same layer (via image TOC)
-/// 3. Compares the file lists
 #[test]
 #[ignore] // Requires podman and test image
 fn test_toc_matches_tar() -> Result<()> {
+    let sh = shell()?;
+
     ensure_test_image().context("Failed to ensure test image")?;
 
-    let image_id = get_image_id(TEST_IMAGE).context("Failed to get image ID")?;
+    let image_id = get_image_id(&sh, TEST_IMAGE).context("Failed to get image ID")?;
     println!(
         "Testing TOC vs tar for image: {} ({})",
         TEST_IMAGE, image_id
     );
 
     // Get TOC
-    let toc_output = Command::new("cargo")
-        .args(&[
-            "run", "--bin", "cstor-rs", "--quiet", "--", "toc", &image_id,
-        ])
-        .output()
-        .context("Failed to run cstor-rs toc")?;
+    let toc_json = cmd!(
+        sh,
+        "cargo run --bin cstor-rs --quiet -- image toc {image_id}"
+    )
+    .read()?;
 
-    if !toc_output.status.success() {
-        let stderr = String::from_utf8_lossy(&toc_output.stderr);
-        anyhow::bail!("toc command failed: {}", stderr);
-    }
-
-    let toc: serde_json::Value = serde_json::from_str(&String::from_utf8(toc_output.stdout)?)?;
+    let toc: serde_json::Value = serde_json::from_str(&toc_json)?;
     let toc_entries = toc["entries"]
         .as_array()
         .context("entries should be an array")?;
@@ -1121,7 +887,6 @@ fn test_toc_matches_tar() -> Result<()> {
         .iter()
         .filter_map(|e| {
             let name = e.get("name")?.as_str()?;
-            // Normalize: strip trailing /
             Some(name.trim_end_matches('/').to_string())
         })
         .filter(|s| !s.is_empty())
@@ -1130,20 +895,11 @@ fn test_toc_matches_tar() -> Result<()> {
     println!("TOC has {} unique entries", toc_names.len());
 
     // Get first layer ID
-    let layers_output = Command::new("cargo")
-        .args(&[
-            "run",
-            "--bin",
-            "cstor-rs",
-            "--quiet",
-            "--",
-            "list-layers",
-            &image_id,
-        ])
-        .output()
-        .context("Failed to list layers")?;
-
-    let layers_str = String::from_utf8(layers_output.stdout)?;
+    let layers_str = cmd!(
+        sh,
+        "cargo run --bin cstor-rs --quiet -- image layers {image_id}"
+    )
+    .read()?;
     let layer_id = layers_str
         .lines()
         .find(|line| line.contains("Layer 1:"))
@@ -1154,36 +910,20 @@ fn test_toc_matches_tar() -> Result<()> {
     // Export layer to tar
     let temp_dir = TempDir::new()?;
     let tar_path = temp_dir.path().join("layer.tar");
+    let tar_path_str = tar_path.display().to_string();
 
-    let export_status = Command::new("cargo")
-        .args(&[
-            "run",
-            "--bin",
-            "cstor-rs",
-            "--quiet",
-            "--",
-            "export-layer",
-            layer_id,
-            "-o",
-            tar_path.to_str().unwrap(),
-        ])
-        .status()
-        .context("Failed to export layer")?;
-
-    if !export_status.success() {
-        anyhow::bail!("Layer export failed");
-    }
+    cmd!(
+        sh,
+        "cargo run --bin cstor-rs --quiet -- layer export {layer_id} -o {tar_path_str}"
+    )
+    .run()?;
 
     // List tar contents
-    let tar_list = Command::new("tar")
-        .args(&["-tf", tar_path.to_str().unwrap()])
-        .output()
-        .context("Failed to list tar contents")?;
+    let tar_list = cmd!(sh, "tar -tf {tar_path_str}").read()?;
 
-    let tar_names: std::collections::HashSet<String> = String::from_utf8_lossy(&tar_list.stdout)
+    let tar_names: std::collections::HashSet<String> = tar_list
         .lines()
         .map(|s| {
-            // Normalize: strip leading ./ and trailing /
             let s = s.strip_prefix("./").unwrap_or(s);
             s.trim_end_matches('/').to_string()
         })
@@ -1223,27 +963,20 @@ fn test_toc_matches_tar() -> Result<()> {
 }
 
 /// Test that splitfdstream round-trip produces correct output.
-///
-/// This test:
-/// 1. Discovers storage and finds an image/layer
-/// 2. Exports the layer via the OLD method (direct tar reconstruction using TarSplitFdStream)
-/// 3. Exports the layer via the NEW method (layer_to_splitfdstream -> reconstruct_tar)
-/// 4. Compares the two outputs to verify they're byte-for-byte identical
-///
-/// This validates that the splitfdstream format correctly encodes and decodes
-/// tar streams without data loss.
 #[test]
 #[ignore] // Requires podman and test image
 fn test_splitfdstream_roundtrip() -> Result<()> {
     use cstor_rs::splitfdstream::reconstruct_tar_seekable;
     use cstor_rs::{
-        DEFAULT_INLINE_THRESHOLD, Storage, TarSplitFdStream, TarSplitItem, layer_to_splitfdstream,
+        layer_to_splitfdstream, Storage, TarSplitFdStream, TarSplitItem, DEFAULT_INLINE_THRESHOLD,
     };
     use std::io::{Read, Write};
 
+    let sh = shell()?;
+
     ensure_test_image().context("Failed to ensure test image")?;
 
-    let image_id = get_image_id(TEST_IMAGE).context("Failed to get image ID")?;
+    let image_id = get_image_id(&sh, TEST_IMAGE).context("Failed to get image ID")?;
     println!(
         "Testing splitfdstream roundtrip for image: {} ({})",
         TEST_IMAGE, image_id
@@ -1279,7 +1012,6 @@ fn test_splitfdstream_roundtrip() -> Result<()> {
                         .context("Failed to write segment")?;
                 }
                 TarSplitItem::FileContent { fd, size, name: _ } => {
-                    // Read file content from fd
                     let mut file = std::fs::File::from(fd);
                     let mut buf = vec![0u8; size as usize];
                     file.read_exact(&mut buf)
@@ -1347,21 +1079,21 @@ fn test_splitfdstream_roundtrip() -> Result<()> {
     // Verify the tar is valid by listing contents
     let temp_dir = TempDir::new()?;
     let tar_path = temp_dir.path().join("test.tar");
+    let tar_path_str = tar_path.display().to_string();
     fs::write(&tar_path, &new_output).context("Failed to write test tar")?;
 
-    let tar_list = Command::new("tar")
-        .args(["-tf", tar_path.to_str().unwrap()])
-        .output()
-        .context("Failed to list tar contents")?;
+    let tar_output = cmd!(sh, "tar -tf {tar_path_str}")
+        .ignore_status()
+        .output()?;
 
-    if tar_list.status.success() {
-        let entry_count = String::from_utf8_lossy(&tar_list.stdout).lines().count();
+    if tar_output.status.success() {
+        let entry_count = String::from_utf8_lossy(&tar_output.stdout).lines().count();
         println!("Tar contains {} entries", entry_count);
         assert!(entry_count > 0, "Tar should have entries");
     } else {
         anyhow::bail!(
             "Generated tar is invalid: {}",
-            String::from_utf8_lossy(&tar_list.stderr)
+            String::from_utf8_lossy(&tar_output.stderr)
         );
     }
 
@@ -1373,40 +1105,27 @@ fn test_splitfdstream_roundtrip() -> Result<()> {
 }
 
 /// Test that file descriptors received via IPC can be used for reflinks.
-///
-/// This test:
-/// 1. Creates a socketpair and streams a layer via IPC
-/// 2. For each file received, attempts to reflink it to a temp directory
-/// 3. Verifies the reflinked content matches the original
-///
-/// This proves the IPC fd-passing approach works for the reflink use case.
 #[test]
 #[ignore] // Requires podman and test image
 fn test_ipc_reflink_extraction() -> Result<()> {
+    let sh = shell()?;
+
     ensure_test_image().context("Failed to ensure test image")?;
 
-    let image_id = get_image_id(TEST_IMAGE).context("Failed to get image ID")?;
+    let image_id = get_image_id(&sh, TEST_IMAGE).context("Failed to get image ID")?;
     println!(
         "Testing IPC reflink extraction for image: {} ({})",
         TEST_IMAGE, image_id
     );
 
     // Get first layer ID
-    let output = Command::new("cargo")
-        .args(&[
-            "run",
-            "--bin",
-            "cstor-rs",
-            "--quiet",
-            "--",
-            "list-layers",
-            &image_id,
-        ])
-        .output()
-        .context("Failed to list layers")?;
+    let output = cmd!(
+        sh,
+        "cargo run --bin cstor-rs --quiet -- image layers {image_id}"
+    )
+    .read()?;
 
-    let output_str = String::from_utf8(output.stdout)?;
-    let layer_id = output_str
+    let layer_id = output
         .lines()
         .find(|line| line.contains("Layer 1:"))
         .and_then(|line| line.split(':').nth(1))
@@ -1418,94 +1137,40 @@ fn test_ipc_reflink_extraction() -> Result<()> {
     // Create temp directory for extraction
     let temp_dir = TempDir::new()?;
 
-    // Export layer directly (not via IPC) and extract
+    // Export layer directly and extract
     let direct_tar = temp_dir.path().join("direct.tar");
-    let direct_status = Command::new("cargo")
-        .args(&[
-            "run",
-            "--bin",
-            "cstor-rs",
-            "--quiet",
-            "--",
-            "export-layer",
-            layer_id,
-            "-o",
-            direct_tar.to_str().unwrap(),
-        ])
-        .status()
-        .context("Failed to run export-layer")?;
-
-    if !direct_status.success() {
-        anyhow::bail!("export-layer failed");
-    }
+    let direct_tar_str = direct_tar.display().to_string();
+    cmd!(
+        sh,
+        "cargo run --bin cstor-rs --quiet -- layer export {layer_id} -o {direct_tar_str}"
+    )
+    .run()?;
 
     // Extract direct tar
     let direct_dir = temp_dir.path().join("direct-extracted");
+    let direct_dir_str = direct_dir.display().to_string();
     fs::create_dir(&direct_dir)?;
+    cmd!(sh, "tar -xf {direct_tar_str} -C {direct_dir_str}").run()?;
 
-    let tar_status = Command::new("tar")
-        .args(&[
-            "-xf",
-            direct_tar.to_str().unwrap(),
-            "-C",
-            direct_dir.to_str().unwrap(),
-        ])
-        .status()
-        .context("Failed to extract direct tar")?;
-
-    if !tar_status.success() {
-        anyhow::bail!("direct tar extraction failed");
-    }
-
-    // Export via IPC and extract (simulating what a cross-process reflink would do)
+    // Export via IPC and extract
     let ipc_tar = temp_dir.path().join("ipc.tar");
-    let ipc_status = Command::new("cargo")
-        .args(&[
-            "run",
-            "--bin",
-            "cstor-rs",
-            "--quiet",
-            "--",
-            "export-layer-ipc",
-            layer_id,
-            "-o",
-            ipc_tar.to_str().unwrap(),
-        ])
-        .status()
-        .context("Failed to run export-layer-ipc")?;
-
-    if !ipc_status.success() {
-        anyhow::bail!("export-layer-ipc failed");
-    }
+    let ipc_tar_str = ipc_tar.display().to_string();
+    cmd!(
+        sh,
+        "cargo run --bin cstor-rs --quiet -- layer export-ipc {layer_id} -o {ipc_tar_str}"
+    )
+    .run()?;
 
     // Extract the IPC tar
     let ipc_dir = temp_dir.path().join("ipc-extracted");
+    let ipc_dir_str = ipc_dir.display().to_string();
     fs::create_dir(&ipc_dir)?;
-
-    let tar_status = Command::new("tar")
-        .args(&[
-            "-xf",
-            ipc_tar.to_str().unwrap(),
-            "-C",
-            ipc_dir.to_str().unwrap(),
-        ])
-        .status()
-        .context("Failed to extract IPC tar")?;
-
-    if !tar_status.success() {
-        anyhow::bail!("IPC tar extraction failed");
-    }
+    cmd!(sh, "tar -xf {ipc_tar_str} -C {ipc_dir_str}").run()?;
 
     // Find regular files in IPC extraction and compare with direct extraction
-    let ipc_files_output = Command::new("find")
-        .args(&[ipc_dir.to_str().unwrap(), "-type", "f"])
-        .output()
-        .context("Failed to find IPC files")?;
+    let ipc_files_output = cmd!(sh, "find {ipc_dir_str} -type f").read()?;
 
-    let ipc_files: Vec<String> = String::from_utf8_lossy(&ipc_files_output.stdout)
-        .lines()
-        .map(|s| s.to_string())
-        .collect();
+    let ipc_files: Vec<&str> = ipc_files_output.lines().collect();
 
     println!("Found {} files in IPC extraction", ipc_files.len());
 
@@ -1514,7 +1179,7 @@ fn test_ipc_reflink_extraction() -> Result<()> {
     for ipc_file in ipc_files.iter().take(5) {
         // Get relative path
         let rel_path = ipc_file
-            .strip_prefix(ipc_dir.to_str().unwrap())
+            .strip_prefix(&ipc_dir_str)
             .unwrap_or(ipc_file)
             .trim_start_matches('/');
 
@@ -1524,35 +1189,20 @@ fn test_ipc_reflink_extraction() -> Result<()> {
             continue;
         }
 
-        // Hash IPC file (no special permissions needed - we extracted the tar)
-        let ipc_hash_output = Command::new("sha256sum")
-            .arg(ipc_file)
-            .output()
-            .context("Failed to hash IPC file")?;
+        let direct_file_str = direct_file.display().to_string();
 
-        // Hash direct file (extracted from tar, no special permissions needed)
-        let direct_hash_output = Command::new("sha256sum")
-            .arg(direct_file.to_str().unwrap())
-            .output()
-            .context("Failed to hash direct file")?;
+        // Hash both files
+        let ipc_hash = cmd!(sh, "sha256sum {ipc_file}").read()?;
+        let direct_hash = cmd!(sh, "sha256sum {direct_file_str}").read()?;
 
-        let ipc_hash = String::from_utf8_lossy(&ipc_hash_output.stdout)
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_string();
-
-        let direct_hash = String::from_utf8_lossy(&direct_hash_output.stdout)
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let ipc_hash = ipc_hash.split_whitespace().next().unwrap_or("");
+        let direct_hash = direct_hash.split_whitespace().next().unwrap_or("");
 
         println!(
             "  {}: IPC={} Direct={}",
             rel_path,
-            &ipc_hash[..8],
-            &direct_hash[..8]
+            &ipc_hash[..8.min(ipc_hash.len())],
+            &direct_hash[..8.min(direct_hash.len())]
         );
 
         if ipc_hash != direct_hash {
@@ -1571,6 +1221,170 @@ fn test_ipc_reflink_extraction() -> Result<()> {
     println!("\n✓ IPC reflink extraction test passed");
     println!("  - IPC fd-passing produces identical file content");
     println!("  - Received fds are suitable for reflink operations");
+
+    Ok(())
+}
+
+/// Test that TOC UID/GID values match what `podman mount` exposes.
+///
+/// This verifies cstor-rs correctly reads container UIDs from tar-split metadata.
+/// When viewed from within the user namespace (via `podman unshare`), the mounted
+/// filesystem should show the same UIDs that are in the TOC.
+///
+/// This is critical for:
+/// 1. Ensuring we read containers-storage correctly
+/// 2. Enabling reflink-based copies where metadata is extracted from tar-split
+#[test]
+#[ignore] // Requires podman and test image
+fn test_toc_uid_gid_matches_podman_mount() -> Result<()> {
+    let sh = shell()?;
+
+    ensure_test_image().context("Failed to ensure test image")?;
+
+    let image_id = get_image_id(&sh, TEST_IMAGE).context("Failed to get image ID")?;
+    println!(
+        "Testing TOC UID/GID vs podman mount for: {} ({})",
+        TEST_IMAGE, image_id
+    );
+
+    // Get TOC from cstor-rs
+    let toc_json = cmd!(
+        sh,
+        "cargo run --bin cstor-rs --quiet -- image toc {image_id}"
+    )
+    .read()?;
+
+    let toc: serde_json::Value = serde_json::from_str(&toc_json)?;
+    let toc_entries = toc["entries"]
+        .as_array()
+        .context("entries should be an array")?;
+
+    println!("TOC has {} entries", toc_entries.len());
+
+    // Create a container to mount
+    let container_name = format!("cstor-test-mount-{}", std::process::id());
+
+    let _ = cmd!(sh, "podman rm -f {container_name}")
+        .ignore_status()
+        .output();
+    cmd!(
+        sh,
+        "podman create --name {container_name} {TEST_IMAGE} true"
+    )
+    .run()?;
+
+    // Get mount point via podman unshare (to be in the user namespace)
+    let mount_output = cmd!(sh, "podman unshare podman mount {container_name}")
+        .ignore_status()
+        .output()?;
+
+    if !mount_output.status.success() {
+        let _ = cmd!(sh, "podman rm -f {container_name}")
+            .ignore_status()
+            .output();
+        let stderr = String::from_utf8_lossy(&mount_output.stderr);
+        anyhow::bail!("Failed to mount container: {}", stderr);
+    }
+
+    let mount_point = String::from_utf8(mount_output.stdout)?.trim().to_string();
+    println!("Container mounted at: {}", mount_point);
+
+    // Sample some regular files from TOC and compare with mounted filesystem
+    let mut checked = 0;
+    let mut mismatches = Vec::new();
+
+    for entry in toc_entries.iter().take(50) {
+        let entry_type = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if entry_type != "reg" {
+            continue; // Only check regular files
+        }
+
+        let name = match entry.get("name").and_then(|n| n.as_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let toc_uid = entry
+            .get("uid")
+            .and_then(|u| u.as_u64())
+            .unwrap_or(u64::MAX);
+        let toc_gid = entry
+            .get("gid")
+            .and_then(|g| g.as_u64())
+            .unwrap_or(u64::MAX);
+
+        if toc_uid == u64::MAX || toc_gid == u64::MAX {
+            continue;
+        }
+
+        // Stat the file via podman unshare to get container-namespace UIDs
+        let file_path = format!("{}/{}", mount_point, name);
+        let stat_output = cmd!(sh, "podman unshare stat -c %u:%g {file_path}")
+            .ignore_status()
+            .output();
+
+        let stat_output = match stat_output {
+            Ok(o) if o.status.success() => o,
+            _ => continue, // File might not exist in merged view
+        };
+
+        let stat_str = String::from_utf8_lossy(&stat_output.stdout);
+        let parts: Vec<&str> = stat_str.trim().split(':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+
+        let mount_uid: u64 = match parts[0].parse() {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let mount_gid: u64 = match parts[1].parse() {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+
+        if toc_uid != mount_uid || toc_gid != mount_gid {
+            mismatches.push(format!(
+                "{}: TOC uid:gid={}:{} vs mount uid:gid={}:{}",
+                name, toc_uid, toc_gid, mount_uid, mount_gid
+            ));
+        }
+
+        checked += 1;
+        if checked >= 10 {
+            break; // Check up to 10 files
+        }
+    }
+
+    // Cleanup: unmount and remove container
+    let _ = cmd!(sh, "podman unshare podman umount {container_name}")
+        .ignore_status()
+        .output();
+    let _ = cmd!(sh, "podman rm -f {container_name}")
+        .ignore_status()
+        .output();
+
+    // Report results
+    println!("Checked {} files", checked);
+
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("  MISMATCH: {}", m);
+        }
+        anyhow::bail!(
+            "{} UID/GID mismatches found out of {} files checked",
+            mismatches.len(),
+            checked
+        );
+    }
+
+    if checked == 0 {
+        anyhow::bail!("No files checked - test inconclusive");
+    }
+
+    println!("✓ All {} checked files have matching UID/GID", checked);
+    println!("  - TOC correctly reads container UIDs from tar-split");
+    println!("  - Metadata can be trusted for reflink-based copies");
 
     Ok(())
 }
