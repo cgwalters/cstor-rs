@@ -350,3 +350,243 @@ integration_test!(test_delete_removes_symlink, || {
 
     Ok(())
 });
+
+integration_test!(test_create_layer_from_splitfdstream, || {
+    use cstor_rs::ImportOptions;
+    use cstor_rs::splitfdstream::SplitfdstreamWriter;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let storage = TestStorage::new()?;
+    let layer_store = storage.storage().layer_store();
+
+    // Create a simple tar archive as a splitfdstream
+    // We'll create a tar with one directory and one file
+
+    // First, create an external file to use for the file content
+    let mut ext_file = NamedTempFile::new()?;
+    ext_file.write_all(b"Hello from splitfdstream!")?;
+    ext_file.flush()?;
+
+    // Build a tar archive in memory
+    let mut tar_buffer = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_buffer);
+
+        // Add a directory
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_path("testdir")?;
+        header.set_mode(0o755);
+        header.set_uid(1000);
+        header.set_gid(1000);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append(&header, std::io::empty())?;
+
+        // Add a file
+        let content = b"Hello from splitfdstream!";
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_path("testdir/hello.txt")?;
+        header.set_mode(0o644);
+        header.set_uid(1000);
+        header.set_gid(1000);
+        header.set_size(content.len() as u64);
+        header.set_cksum();
+        builder.append(&header, content.as_slice())?;
+
+        builder.finish()?;
+    }
+
+    // Wrap the tar as a splitfdstream (inline only for simplicity)
+    let mut stream_buffer = Vec::new();
+    {
+        let mut writer = SplitfdstreamWriter::new(&mut stream_buffer);
+        writer.write_inline(&tar_buffer)?;
+        writer.finish()?;
+    }
+
+    // Open the external file for reading
+    let ext_file_read = std::fs::File::open(ext_file.path())?;
+    let files = vec![ext_file_read];
+
+    // Import the layer
+    let options = ImportOptions::default();
+    let (layer, stats) = layer_store.create_layer_from_splitfdstream(
+        None,
+        None,
+        &["splitfd-test"],
+        stream_buffer.as_slice(),
+        &files,
+        &options,
+    )?;
+
+    // Verify layer was created
+    assert!(!layer.id.is_empty());
+    assert_eq!(layer.id.len(), 64);
+    assert!(layer.created.is_some());
+    assert!(!layer.is_incomplete());
+    assert_eq!(layer.names, Some(vec!["splitfd-test".to_string()]));
+
+    // Verify stats
+    assert_eq!(stats.directories_created, 1);
+    assert_eq!(stats.files_imported, 1);
+
+    // Verify directory structure
+    let layer_dir = storage.overlay_path().join(&layer.id);
+    assert!(layer_dir.exists());
+    assert!(layer_dir.join("diff").is_dir());
+    assert!(layer_dir.join("link").is_file());
+
+    // Verify extracted content
+    let diff_dir = layer_dir.join("diff");
+    assert!(diff_dir.join("testdir").is_dir());
+    assert!(diff_dir.join("testdir/hello.txt").is_file());
+
+    let content = std::fs::read_to_string(diff_dir.join("testdir/hello.txt"))?;
+    assert_eq!(content, "Hello from splitfdstream!");
+
+    // Verify tar-split was generated
+    let tar_split_path = storage
+        .root_path()
+        .join("overlay-layers")
+        .join(format!("{}.tar-split.gz", layer.id));
+    assert!(tar_split_path.exists());
+
+    Ok(())
+});
+
+integration_test!(test_create_layer_from_splitfdstream_with_parent, || {
+    use cstor_rs::ImportOptions;
+    use cstor_rs::splitfdstream::SplitfdstreamWriter;
+
+    let storage = TestStorage::new()?;
+    let layer_store = storage.storage().layer_store();
+
+    // Create a parent layer first
+    let parent = layer_store.create_layer(None, None, &[], None::<std::io::Empty>)?;
+
+    // Create an empty tar
+    let mut tar_buffer = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_buffer);
+
+        // Add a directory
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_path("childdir")?;
+        header.set_mode(0o755);
+        header.set_uid(1000);
+        header.set_gid(1000);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append(&header, std::io::empty())?;
+
+        builder.finish()?;
+    }
+
+    // Wrap as splitfdstream
+    let mut stream_buffer = Vec::new();
+    {
+        let mut writer = SplitfdstreamWriter::new(&mut stream_buffer);
+        writer.write_inline(&tar_buffer)?;
+        writer.finish()?;
+    }
+
+    // Import the layer with parent
+    let options = ImportOptions::default();
+    let (layer, stats) = layer_store.create_layer_from_splitfdstream(
+        None,
+        Some(&parent.id),
+        &[],
+        stream_buffer.as_slice(),
+        &[],
+        &options,
+    )?;
+
+    // Verify parent relationship
+    assert_eq!(layer.parent, Some(parent.id.clone()));
+    assert_eq!(stats.directories_created, 1);
+
+    // Verify lower file exists
+    let layer_dir = storage.overlay_path().join(&layer.id);
+    let lower_content = std::fs::read_to_string(layer_dir.join("lower"))?;
+    assert!(lower_content.starts_with("l/"));
+
+    Ok(())
+});
+
+integration_test!(test_create_layer_from_splitfdstream_symlink, || {
+    use cstor_rs::ImportOptions;
+    use cstor_rs::splitfdstream::SplitfdstreamWriter;
+
+    let storage = TestStorage::new()?;
+    let layer_store = storage.storage().layer_store();
+
+    // Create a tar with a symlink
+    let mut tar_buffer = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_buffer);
+
+        // Add a regular file first
+        let content = b"target content";
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_path("target.txt")?;
+        header.set_mode(0o644);
+        header.set_uid(1000);
+        header.set_gid(1000);
+        header.set_size(content.len() as u64);
+        header.set_cksum();
+        builder.append(&header, content.as_slice())?;
+
+        // Add a symlink
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_path("link.txt")?;
+        header.set_link_name("target.txt")?;
+        header.set_mode(0o777);
+        header.set_uid(1000);
+        header.set_gid(1000);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append(&header, std::io::empty())?;
+
+        builder.finish()?;
+    }
+
+    // Wrap as splitfdstream
+    let mut stream_buffer = Vec::new();
+    {
+        let mut writer = SplitfdstreamWriter::new(&mut stream_buffer);
+        writer.write_inline(&tar_buffer)?;
+        writer.finish()?;
+    }
+
+    // Import the layer
+    let options = ImportOptions::default();
+    let (layer, stats) = layer_store.create_layer_from_splitfdstream(
+        None,
+        None,
+        &[],
+        stream_buffer.as_slice(),
+        &[],
+        &options,
+    )?;
+
+    // Verify stats
+    assert_eq!(stats.files_imported, 1);
+    assert_eq!(stats.symlinks_created, 1);
+
+    // Verify symlink
+    let diff_dir = storage.overlay_path().join(&layer.id).join("diff");
+    let link_path = diff_dir.join("link.txt");
+    assert!(link_path.is_symlink());
+    assert_eq!(
+        std::fs::read_link(&link_path)?.to_str().unwrap(),
+        "target.txt"
+    );
+
+    Ok(())
+});

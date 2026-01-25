@@ -136,7 +136,10 @@ pub use toc::{Toc, TocEntry, TocEntryType};
 
 // Layer creation and management exports
 pub use layer_builder::LayerBuilder;
-pub use layer_store::{IdMapping, LayerRecord, LayerStore, generate_layer_id, generate_link_id};
+pub use layer_store::{
+    IdMapping, ImportOptions, ImportStats, LayerRecord, LayerStore, generate_layer_id,
+    generate_link_id,
+};
 pub use tar_split_writer::TarSplitWriter;
 
 // Layer extraction exports
