@@ -13,7 +13,7 @@
 //!   cargo run --example ipc_reflink busybox ~/tmp/extracted
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use base64::prelude::*;
@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
 async fn extract_layer_via_ipc(
     storage: &Storage,
     layer: &Layer,
-    dest_dir: &PathBuf,
+    dest_dir: &Path,
     force_copy: bool,
 ) -> Result<(usize, usize)> {
     // Collect tar-split items synchronously (Storage is not Send)

@@ -468,10 +468,10 @@ impl<'a> ImageStore<'a> {
 
         // Exact match first
         for image in &images {
-            if let Some(names) = &image.names {
-                if names.iter().any(|n| n == name) {
-                    return Ok(image.clone());
-                }
+            if let Some(names) = &image.names
+                && names.iter().any(|n| n == name)
+            {
+                return Ok(image.clone());
             }
         }
 

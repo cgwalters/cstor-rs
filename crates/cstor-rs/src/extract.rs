@@ -354,10 +354,10 @@ fn extract_toc_entry(
     }
 
     // Create parent directories
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            dest.create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        dest.create_dir_all(parent)?;
     }
 
     match entry.entry_type {
@@ -373,8 +373,8 @@ fn extract_toc_entry(
                     stats.permission_failures += 1;
                 }
             }
-            if options.preserve_ownership {
-                if rustix::fs::chownat(
+            if options.preserve_ownership
+                && rustix::fs::chownat(
                     dest,
                     path,
                     Some(Uid::from_raw(entry.uid)),
@@ -382,9 +382,8 @@ fn extract_toc_entry(
                     AtFlags::empty(),
                 )
                 .is_err()
-                {
-                    stats.ownership_failures += 1;
-                }
+            {
+                stats.ownership_failures += 1;
             }
             stats.directories_created += 1;
         }
@@ -413,8 +412,8 @@ fn extract_toc_entry(
                     stats.permission_failures += 1;
                 }
             }
-            if options.preserve_ownership {
-                if rustix::fs::chownat(
+            if options.preserve_ownership
+                && rustix::fs::chownat(
                     dest,
                     path,
                     Some(Uid::from_raw(entry.uid)),
@@ -422,17 +421,16 @@ fn extract_toc_entry(
                     AtFlags::empty(),
                 )
                 .is_err()
-                {
-                    stats.ownership_failures += 1;
-                }
+            {
+                stats.ownership_failures += 1;
             }
         }
         TocEntryType::Symlink => {
             if let Some(ref target) = entry.link_name {
                 let _ = dest.remove_file(path);
                 dest.symlink_contents(target, path)?;
-                if options.preserve_ownership {
-                    if rustix::fs::chownat(
+                if options.preserve_ownership
+                    && rustix::fs::chownat(
                         dest,
                         path,
                         Some(Uid::from_raw(entry.uid)),
@@ -440,9 +438,8 @@ fn extract_toc_entry(
                         AtFlags::SYMLINK_NOFOLLOW,
                     )
                     .is_err()
-                    {
-                        stats.ownership_failures += 1;
-                    }
+                {
+                    stats.ownership_failures += 1;
                 }
                 stats.symlinks_created += 1;
             }
@@ -481,46 +478,46 @@ fn process_non_file_entry(
     let path = Path::new(path_str);
 
     // Check for whiteouts
-    if options.process_whiteouts {
-        if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-            if filename == OPAQUE_WHITEOUT {
-                // Opaque whiteout - clear directory contents
-                if let Some(parent) = path.parent() {
-                    if let Ok(parent_dir) = dest.open_dir(parent) {
-                        for dir_entry in parent_dir.entries()?.flatten() {
-                            let name = dir_entry.file_name();
-                            if let Ok(ft) = dir_entry.file_type() {
-                                if ft.is_dir() {
-                                    let _ = parent_dir.remove_dir_all(&name);
-                                } else {
-                                    let _ = parent_dir.remove_file(&name);
-                                }
-                            }
+    if options.process_whiteouts
+        && let Some(filename) = path.file_name().and_then(|f| f.to_str())
+    {
+        if filename == OPAQUE_WHITEOUT {
+            // Opaque whiteout - clear directory contents
+            if let Some(parent) = path.parent()
+                && let Ok(parent_dir) = dest.open_dir(parent)
+            {
+                for dir_entry in parent_dir.entries()?.flatten() {
+                    let name = dir_entry.file_name();
+                    if let Ok(ft) = dir_entry.file_type() {
+                        if ft.is_dir() {
+                            let _ = parent_dir.remove_dir_all(&name);
+                        } else {
+                            let _ = parent_dir.remove_file(&name);
                         }
                     }
                 }
-                stats.whiteouts_processed += 1;
-                return Ok(());
-            } else if let Some(target_name) = filename.strip_prefix(WHITEOUT_PREFIX) {
-                // Regular whiteout - remove target
-                let target_path = match path.parent() {
-                    Some(p) if !p.as_os_str().is_empty() => p.join(target_name),
-                    _ => PathBuf::from(target_name),
-                };
-                if dest.remove_file(&target_path).is_err() {
-                    let _ = dest.remove_dir_all(&target_path);
-                }
-                stats.whiteouts_processed += 1;
-                return Ok(());
             }
+            stats.whiteouts_processed += 1;
+            return Ok(());
+        } else if let Some(target_name) = filename.strip_prefix(WHITEOUT_PREFIX) {
+            // Regular whiteout - remove target
+            let target_path = match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.join(target_name),
+                _ => PathBuf::from(target_name),
+            };
+            if dest.remove_file(&target_path).is_err() {
+                let _ = dest.remove_dir_all(&target_path);
+            }
+            stats.whiteouts_processed += 1;
+            return Ok(());
         }
     }
 
     // Create parent directories
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            dest.create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        dest.create_dir_all(parent)?;
     }
 
     // Handle by type
@@ -538,8 +535,8 @@ fn process_non_file_entry(
                     stats.permission_failures += 1;
                 }
             }
-            if options.preserve_ownership {
-                if rustix::fs::chownat(
+            if options.preserve_ownership
+                && rustix::fs::chownat(
                     dest,
                     path,
                     Some(Uid::from_raw(header.uid)),
@@ -547,9 +544,8 @@ fn process_non_file_entry(
                     AtFlags::empty(),
                 )
                 .is_err()
-                {
-                    stats.ownership_failures += 1;
-                }
+            {
+                stats.ownership_failures += 1;
             }
             stats.directories_created += 1;
         }
@@ -558,8 +554,8 @@ fn process_non_file_entry(
             if !header.linkname.is_empty() {
                 let _ = dest.remove_file(path);
                 dest.symlink_contents(&header.linkname, path)?;
-                if options.preserve_ownership {
-                    if rustix::fs::chownat(
+                if options.preserve_ownership
+                    && rustix::fs::chownat(
                         dest,
                         path,
                         Some(Uid::from_raw(header.uid)),
@@ -567,9 +563,8 @@ fn process_non_file_entry(
                         AtFlags::SYMLINK_NOFOLLOW,
                     )
                     .is_err()
-                    {
-                        stats.ownership_failures += 1;
-                    }
+                {
+                    stats.ownership_failures += 1;
                 }
                 stats.symlinks_created += 1;
             }
@@ -598,8 +593,8 @@ fn process_non_file_entry(
                         stats.permission_failures += 1;
                     }
                 }
-                if options.preserve_ownership {
-                    if rustix::fs::chownat(
+                if options.preserve_ownership
+                    && rustix::fs::chownat(
                         dest,
                         path,
                         Some(Uid::from_raw(header.uid)),
@@ -607,9 +602,8 @@ fn process_non_file_entry(
                         AtFlags::empty(),
                     )
                     .is_err()
-                    {
-                        stats.ownership_failures += 1;
-                    }
+                {
+                    stats.ownership_failures += 1;
                 }
                 stats.files_extracted += 1;
             }
@@ -644,10 +638,10 @@ fn extract_regular_file(
     let path = Path::new(path_str);
 
     // Create parent directories
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            dest.create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        dest.create_dir_all(parent)?;
     }
 
     // Remove existing file
@@ -663,8 +657,8 @@ fn extract_regular_file(
             stats.permission_failures += 1;
         }
     }
-    if options.preserve_ownership {
-        if rustix::fs::chownat(
+    if options.preserve_ownership
+        && rustix::fs::chownat(
             dest,
             path,
             Some(Uid::from_raw(header.uid)),
@@ -672,9 +666,8 @@ fn extract_regular_file(
             AtFlags::empty(),
         )
         .is_err()
-        {
-            stats.ownership_failures += 1;
-        }
+    {
+        stats.ownership_failures += 1;
     }
 
     Ok(())
@@ -809,32 +802,29 @@ where
                     }
 
                     // Try to parse as a tar header
-                    match TarHeader::from_bytes(block) {
-                        Ok(mut new_header) => {
-                            // Process pending header
-                            if let Some(mut pending) = current_header.take() {
-                                if let Some(long_name) = gnu_long_name.take() {
-                                    pending.name = long_name;
-                                }
-                                if let Some(long_linkname) = gnu_long_linkname.take() {
-                                    pending.linkname = long_linkname;
-                                }
-                                if !pending.is_gnu_long_name() && !pending.is_gnu_long_linkname() {
-                                    process_non_file_entry(&pending, dest, options, &mut stats)?;
-                                }
-                            }
-
-                            // Apply any pending GNU long names
+                    if let Ok(mut new_header) = TarHeader::from_bytes(block) {
+                        // Process pending header
+                        if let Some(mut pending) = current_header.take() {
                             if let Some(long_name) = gnu_long_name.take() {
-                                new_header.name = long_name;
+                                pending.name = long_name;
                             }
                             if let Some(long_linkname) = gnu_long_linkname.take() {
-                                new_header.linkname = long_linkname;
+                                pending.linkname = long_linkname;
                             }
-
-                            current_header = Some(new_header);
+                            if !pending.is_gnu_long_name() && !pending.is_gnu_long_linkname() {
+                                process_non_file_entry(&pending, dest, options, &mut stats)?;
+                            }
                         }
-                        Err(_) => {}
+
+                        // Apply any pending GNU long names
+                        if let Some(long_name) = gnu_long_name.take() {
+                            new_header.name = long_name;
+                        }
+                        if let Some(long_linkname) = gnu_long_linkname.take() {
+                            new_header.linkname = long_linkname;
+                        }
+
+                        current_header = Some(new_header);
                     }
                     offset += 512;
                 }

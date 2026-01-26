@@ -1226,10 +1226,9 @@ mod tests {
             use std::io::Seek;
             f.seek(std::io::SeekFrom::End(0)).unwrap();
 
-            let mut fds = [f];
+            let fds = [f];
             let mut output = Vec::new();
-            let bytes =
-                reconstruct_tar_seekable(stream_buf.as_slice(), &mut fds, &mut output).unwrap();
+            let bytes = reconstruct_tar_seekable(stream_buf.as_slice(), &fds, &mut output).unwrap();
 
             // seekable version should rewind before each read
             assert_eq!(output, b"CONTENT|CONTENT");
@@ -1324,7 +1323,7 @@ mod tests {
             // Compute checksum
             let checksum: u32 = header[..148]
                 .iter()
-                .chain(std::iter::repeat(&b' ').take(8))
+                .chain(std::iter::repeat_n(&b' ', 8))
                 .chain(header[156..512].iter())
                 .map(|&b| b as u32)
                 .sum();
@@ -1423,7 +1422,7 @@ mod tests {
             // Compute checksum
             let checksum: u32 = header[..148]
                 .iter()
-                .chain(std::iter::repeat(&b' ').take(8))
+                .chain(std::iter::repeat_n(&b' ', 8))
                 .chain(header[156..512].iter())
                 .map(|&b| b as u32)
                 .sum();

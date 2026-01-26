@@ -239,16 +239,12 @@ impl Layer {
 
     /// Get metadata for a file in the layer's diff directory.
     pub fn metadata(&self, path: impl AsRef<std::path::Path>) -> Result<cap_std::fs::Metadata> {
-        self.diff_dir
-            .metadata(path)
-            .map_err(|e| StorageError::Io(e))
+        self.diff_dir.metadata(path).map_err(StorageError::Io)
     }
 
     /// Read directory entries using Dir handle.
     pub fn read_dir(&self, path: impl AsRef<std::path::Path>) -> Result<cap_std::fs::ReadDir> {
-        self.diff_dir
-            .read_dir(path)
-            .map_err(|e| StorageError::Io(e))
+        self.diff_dir.read_dir(path).map_err(StorageError::Io)
     }
 
     /// Check if a whiteout file exists for the given filename.

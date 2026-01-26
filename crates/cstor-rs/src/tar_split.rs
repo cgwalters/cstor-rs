@@ -239,7 +239,7 @@ impl TarHeader {
 
         let computed_checksum: u32 = header[..148]
             .iter()
-            .chain(std::iter::repeat(&b' ').take(8)) // checksum field treated as spaces
+            .chain(std::iter::repeat_n(&b' ', 8)) // checksum field treated as spaces
             .chain(header[156..512].iter())
             .map(|&b| b as u32)
             .sum();
@@ -1078,7 +1078,7 @@ mod tests {
         // Compute checksum: sum of all bytes with checksum field as spaces
         let checksum: u32 = header[..148]
             .iter()
-            .chain(std::iter::repeat(&b' ').take(8))
+            .chain(std::iter::repeat_n(&b' ', 8))
             .chain(header[156..512].iter())
             .map(|&b| b as u32)
             .sum();

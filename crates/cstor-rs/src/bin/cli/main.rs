@@ -421,12 +421,12 @@ fn open_layer_by_id_or_link(storage: &Storage, layer_ref: &str) -> Result<Layer>
     }
 
     // Try resolving as a link ID (base32, 26 chars)
-    if layer_ref.len() == 26 && layer_ref.chars().all(|c| c.is_ascii_alphanumeric()) {
-        if let Ok(layer_id) = storage.resolve_link(layer_ref) {
-            if let Ok(layer) = Layer::open(storage, &layer_id) {
-                return Ok(layer);
-            }
-        }
+    if layer_ref.len() == 26
+        && layer_ref.chars().all(|c| c.is_ascii_alphanumeric())
+        && let Ok(layer_id) = storage.resolve_link(layer_ref)
+        && let Ok(layer) = Layer::open(storage, &layer_id)
+    {
+        return Ok(layer);
     }
 
     // Try prefix matching on layer IDs

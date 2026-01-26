@@ -849,10 +849,10 @@ fn extract_splitfdstream_to_dir<R: Read>(
         }
 
         // Check for whiteouts - skip them in import (they're for extraction)
-        if let Some(filename) = normalized_path.file_name().and_then(|f| f.to_str()) {
-            if filename == OPAQUE_WHITEOUT || filename.starts_with(WHITEOUT_PREFIX) {
-                continue;
-            }
+        if let Some(filename) = normalized_path.file_name().and_then(|f| f.to_str())
+            && (filename == OPAQUE_WHITEOUT || filename.starts_with(WHITEOUT_PREFIX))
+        {
+            continue;
         }
 
         // Create parent directories

@@ -392,9 +392,9 @@ fn test_copy_to_oci_matches_skopeo() -> Result<()> {
     println!("  Config digests match");
 
     // Read and compare config content
-    let cstor_config = read_oci_blob(&cstor_dir, &cstor_config_digest.to_string())
+    let cstor_config = read_oci_blob(&cstor_dir, cstor_config_digest.as_ref())
         .context("Failed to read cstor-rs config blob")?;
-    let skopeo_config = read_oci_blob(&skopeo_dir, &skopeo_config_digest.to_string())
+    let skopeo_config = read_oci_blob(&skopeo_dir, skopeo_config_digest.as_ref())
         .context("Failed to read skopeo config blob")?;
 
     if cstor_config != skopeo_config {
@@ -438,9 +438,9 @@ fn test_copy_to_oci_matches_skopeo() -> Result<()> {
         }
 
         // Read layer blobs to verify sizes match
-        let cstor_blob = read_oci_blob(&cstor_dir, &cstor_digest.to_string())
+        let cstor_blob = read_oci_blob(&cstor_dir, cstor_digest.as_ref())
             .with_context(|| format!("Failed to read cstor-rs layer {}", i + 1))?;
-        let skopeo_blob = read_oci_blob(&skopeo_dir, &skopeo_digest.to_string())
+        let skopeo_blob = read_oci_blob(&skopeo_dir, skopeo_digest.as_ref())
             .with_context(|| format!("Failed to read skopeo layer {}", i + 1))?;
 
         println!("    cstor-rs blob size: {} bytes", cstor_blob.len());

@@ -223,10 +223,10 @@ pub fn can_bypass_file_permissions() -> bool {
     }
 
     // Check for CAP_DAC_OVERRIDE capability
-    if let Ok(caps) = capabilities(None) {
-        if caps.effective.contains(CapabilitySet::DAC_OVERRIDE) {
-            return true;
-        }
+    if let Ok(caps) = capabilities(None)
+        && caps.effective.contains(CapabilitySet::DAC_OVERRIDE)
+    {
+        return true;
     }
 
     false

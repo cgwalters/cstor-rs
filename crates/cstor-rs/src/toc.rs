@@ -614,10 +614,9 @@ impl Toc {
                                     }
                                     if !pending.is_gnu_long_name()
                                         && !pending.is_gnu_long_linkname()
+                                        && let Some(entry) = TocEntry::from_tar_header(&pending)
                                     {
-                                        if let Some(entry) = TocEntry::from_tar_header(&pending) {
-                                            entries.push(entry);
-                                        }
+                                        entries.push(entry);
                                     }
                                 }
                                 current_header = Some(new_header);
@@ -669,10 +668,11 @@ impl Toc {
             if let Some(long_linkname) = gnu_long_linkname.take() {
                 pending.linkname = long_linkname;
             }
-            if !pending.is_gnu_long_name() && !pending.is_gnu_long_linkname() {
-                if let Some(entry) = TocEntry::from_tar_header(&pending) {
-                    entries.push(entry);
-                }
+            if !pending.is_gnu_long_name()
+                && !pending.is_gnu_long_linkname()
+                && let Some(entry) = TocEntry::from_tar_header(&pending)
+            {
+                entries.push(entry);
             }
         }
 

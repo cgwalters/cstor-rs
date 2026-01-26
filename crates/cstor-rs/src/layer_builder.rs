@@ -179,10 +179,10 @@ impl LayerBuilder {
 
     /// Ensure parent directories exist for a path.
     fn ensure_parent_dirs(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                self.diff_handle.create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.diff_handle.create_dir_all(parent)?;
         }
         Ok(())
     }
@@ -587,10 +587,10 @@ impl Drop for LayerBuilder {
     fn drop(&mut self) {
         // Clean up staging directory if not committed
         // This is a best-effort cleanup
-        if let Ok(layers_dir) = self.storage_root.open_dir("overlay-layers") {
-            if let Ok(staging) = layers_dir.open_dir(".staging") {
-                let _ = staging.remove_dir_all(&self.layer_id);
-            }
+        if let Ok(layers_dir) = self.storage_root.open_dir("overlay-layers")
+            && let Ok(staging) = layers_dir.open_dir(".staging")
+        {
+            let _ = staging.remove_dir_all(&self.layer_id);
         }
     }
 }
