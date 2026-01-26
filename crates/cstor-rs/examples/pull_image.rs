@@ -15,17 +15,16 @@
 //!   cargo run --example pull_image -p cstor-rs -- --arch arm64 docker.io/library/alpine:latest
 
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use cstor_rs::{LayerRecord, Storage, generate_layer_id};
+use cstor_rs::Storage;
 use flate2::read::GzDecoder;
 use oci_client::Reference;
 use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::manifest::{OciDescriptor, OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
-use oci_spec::image::ImageConfiguration;
+use oci_spec::image::{Digest as OciDigest, ImageConfiguration, MediaType};
 use sha2::{Digest, Sha256};
 use zstd::stream::read::Decoder as ZstdDecoder;
 
@@ -107,11 +106,11 @@ impl PullOptions {
 #[derive(Debug)]
 struct DownloadedLayer {
     /// Compressed digest (from manifest)
-    compressed_digest: String,
+    compressed_digest: OciDigest,
     /// Compressed size
     compressed_size: u64,
     /// Diff digest (sha256 of uncompressed tar)
-    diff_digest: String,
+    diff_digest: OciDigest,
     /// Uncompressed size
     diff_size: u64,
     /// Uncompressed tar data
@@ -181,9 +180,9 @@ async fn main() -> Result<()> {
 
         let layer = download_layer(&client, &reference, layer_desc).await?;
         println!(
-            "    Uncompressed: {} bytes, diff_id: sha256:{}...",
+            "    Uncompressed: {} bytes, diff_id: {}...",
             layer.diff_size,
-            &layer.diff_digest[..12]
+            &layer.diff_digest.to_string()[..19] // "sha256:" + first 12 hex chars
         );
         downloaded_layers.push(layer);
     }
@@ -202,7 +201,7 @@ async fn main() -> Result<()> {
         .zip(config_diff_ids.iter())
         .enumerate()
     {
-        let computed = format!("sha256:{}", layer.diff_digest);
+        let computed = layer.diff_digest.to_string();
         let expected = expected_diff_id.to_string();
         if computed != expected {
             bail!(
@@ -233,21 +232,23 @@ async fn main() -> Result<()> {
 
     for (i, layer) in downloaded_layers.iter().enumerate() {
         println!(
-            "  Creating layer {}/{}: sha256:{}...",
+            "  Creating layer {}/{}: {}...",
             i + 1,
             downloaded_layers.len(),
-            &layer.diff_digest[..12]
+            &layer.diff_digest.to_string()[..19] // "sha256:" + first 12 hex chars
         );
 
-        let layer_record = create_layer_from_tar(
-            &layer_store,
-            &layer.tar_data,
-            parent_id.as_deref(),
-            &layer.diff_digest,
-            layer.diff_size,
-            &layer.compressed_digest,
-            layer.compressed_size,
-        )?;
+        let layer_record = layer_store
+            .create_layer_from_tar(
+                None,
+                parent_id.as_deref(),
+                &[],
+                layer.tar_data.as_slice(),
+                &layer.diff_digest,
+                &layer.compressed_digest,
+                layer.compressed_size,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to create layer: {}", e))?;
 
         println!("    Layer ID: {}", layer_record.id);
         parent_id = Some(layer_record.id.clone());
@@ -388,14 +389,16 @@ async fn download_layer(
     let diff_size = tar_data.len() as u64;
 
     // Compute diff digest (sha256 of uncompressed tar)
-    let diff_digest = compute_sha256(&tar_data);
+    let diff_digest_hex = compute_sha256(&tar_data);
+    let diff_digest: OciDigest = format!("sha256:{}", diff_digest_hex)
+        .parse()
+        .context("Invalid diff digest")?;
 
-    // Extract compressed digest (remove "sha256:" prefix)
-    let compressed_digest = layer_desc
+    // Parse compressed digest from manifest
+    let compressed_digest: OciDigest = layer_desc
         .digest
-        .strip_prefix("sha256:")
-        .unwrap_or(&layer_desc.digest)
-        .to_string();
+        .parse()
+        .context("Invalid compressed digest")?;
 
     Ok(DownloadedLayer {
         compressed_digest,
@@ -408,40 +411,46 @@ async fn download_layer(
 
 /// Decompress layer based on media type
 fn decompress_layer(data: &[u8], media_type: &str) -> Result<Vec<u8>> {
-    if media_type.contains("gzip") || media_type.ends_with("+gzip") {
-        // Gzip compressed
-        let mut decoder = GzDecoder::new(data);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .context("Failed to decompress gzip layer")?;
-        Ok(decompressed)
-    } else if media_type.contains("zstd") || media_type.ends_with("+zstd") {
-        // Zstd compressed
-        let mut decoder = ZstdDecoder::new(data).context("Failed to create zstd decoder")?;
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .context("Failed to decompress zstd layer")?;
-        Ok(decompressed)
-    } else if media_type.contains("tar") && !media_type.contains('+') {
-        // Uncompressed tar
-        Ok(data.to_vec())
-    } else {
-        // Try gzip first (most common), then zstd, fall back to uncompressed
-        if let Ok(mut decoder) = ZstdDecoder::new(data) {
+    match MediaType::from(media_type) {
+        MediaType::ImageLayerGzip | MediaType::ImageLayerNonDistributableGzip => {
+            let mut decoder = GzDecoder::new(data);
             let mut decompressed = Vec::new();
-            if decoder.read_to_end(&mut decompressed).is_ok() {
-                return Ok(decompressed);
+            decoder
+                .read_to_end(&mut decompressed)
+                .context("Failed to decompress gzip layer")?;
+            Ok(decompressed)
+        }
+        MediaType::ImageLayerZstd | MediaType::ImageLayerNonDistributableZstd => {
+            let mut decoder = ZstdDecoder::new(data).context("Failed to create zstd decoder")?;
+            let mut decompressed = Vec::new();
+            decoder
+                .read_to_end(&mut decompressed)
+                .context("Failed to decompress zstd layer")?;
+            Ok(decompressed)
+        }
+        MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => Ok(data.to_vec()),
+        MediaType::Other(other) => {
+            // Handle Docker-style media types which aren't in the OCI enum
+            if other.ends_with(".gzip") || other.ends_with("+gzip") {
+                let mut decoder = GzDecoder::new(data);
+                let mut decompressed = Vec::new();
+                decoder
+                    .read_to_end(&mut decompressed)
+                    .context("Failed to decompress gzip layer")?;
+                Ok(decompressed)
+            } else if other.ends_with("+zstd") {
+                let mut decoder =
+                    ZstdDecoder::new(data).context("Failed to create zstd decoder")?;
+                let mut decompressed = Vec::new();
+                decoder
+                    .read_to_end(&mut decompressed)
+                    .context("Failed to decompress zstd layer")?;
+                Ok(decompressed)
+            } else {
+                bail!("Unsupported layer media type: {other}")
             }
         }
-        // Try gzip
-        let mut decoder = GzDecoder::new(data);
-        let mut decompressed = Vec::new();
-        match decoder.read_to_end(&mut decompressed) {
-            Ok(_) if !decompressed.is_empty() => Ok(decompressed),
-            _ => Ok(data.to_vec()), // Fall back to raw data
-        }
+        other => bail!("Unexpected media type for layer: {other}"),
     }
 }
 
@@ -450,170 +459,4 @@ fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
-}
-
-/// Create a layer from uncompressed tar data
-fn create_layer_from_tar(
-    layer_store: &cstor_rs::LayerStore,
-    tar_data: &[u8],
-    parent_id: Option<&str>,
-    diff_digest: &str,
-    diff_size: u64,
-    compressed_digest: &str,
-    compressed_size: u64,
-) -> Result<LayerRecord> {
-    use tar::Archive;
-
-    // Generate layer ID
-    let layer_id = generate_layer_id();
-
-    // First, create the basic layer record
-    let mut record = layer_store
-        .create_layer(Some(&layer_id), parent_id, &[], None::<std::io::Empty>)
-        .context("Failed to create layer")?;
-
-    // Discover storage path
-    let storage_root = discover_storage_path()?;
-    let overlay_path = storage_root.join("overlay").join(&layer_id).join("diff");
-
-    // Extract tar to diff directory
-    let mut archive = Archive::new(tar_data);
-
-    for entry_result in archive.entries().context("Failed to read tar entries")? {
-        let mut entry = entry_result.context("Failed to read tar entry")?;
-
-        // Get path (convert to owned to avoid borrow issues)
-        let path = entry
-            .path()
-            .context("Failed to get entry path")?
-            .into_owned();
-        let dest_path = overlay_path.join(&path);
-
-        // Create parent directories
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-
-        // Handle entry type
-        match entry.header().entry_type() {
-            tar::EntryType::Directory => {
-                std::fs::create_dir_all(&dest_path).ok();
-                // Set permissions
-                if let Ok(mode) = entry.header().mode() {
-                    let perms = std::fs::Permissions::from_mode(mode);
-                    std::fs::set_permissions(&dest_path, perms).ok();
-                }
-            }
-            tar::EntryType::Regular | tar::EntryType::Continuous => {
-                // Unpack file
-                entry
-                    .unpack(&dest_path)
-                    .with_context(|| format!("Failed to unpack {}", path.display()))?;
-            }
-            tar::EntryType::Symlink => {
-                if let Ok(Some(target)) = entry.header().link_name() {
-                    // Remove existing file if any
-                    std::fs::remove_file(&dest_path).ok();
-                    std::os::unix::fs::symlink(&*target, &dest_path).ok();
-                }
-            }
-            tar::EntryType::Link => {
-                if let Ok(Some(target)) = entry.header().link_name() {
-                    let target_path = overlay_path.join(&*target);
-                    // Remove existing file if any
-                    std::fs::remove_file(&dest_path).ok();
-                    std::fs::hard_link(&target_path, &dest_path).ok();
-                }
-            }
-            _ => {
-                // Skip other types (device nodes, etc.)
-            }
-        }
-    }
-
-    // Update the layer record with digest info
-    record.diff_digest = Some(format!("sha256:{}", diff_digest));
-    record.diff_size = Some(diff_size as i64);
-    record.compressed_diff_digest = Some(format!("sha256:{}", compressed_digest));
-    record.compressed_size = Some(compressed_size as i64);
-
-    // Update layers.json with the digest info
-    update_layer_record(&storage_root, &record)?;
-
-    Ok(record)
-}
-
-/// Discover storage path from environment or defaults
-fn discover_storage_path() -> Result<PathBuf> {
-    // Check environment variable first
-    if let Ok(path) = std::env::var("CONTAINERS_STORAGE_ROOT") {
-        return Ok(PathBuf::from(path));
-    }
-
-    // Check rootless location
-    if let Ok(home) = std::env::var("HOME") {
-        let rootless_path = PathBuf::from(&home).join(".local/share/containers/storage");
-        if rootless_path.exists() {
-            return Ok(rootless_path);
-        }
-    }
-
-    // Default to root location
-    let root_path = PathBuf::from("/var/lib/containers/storage");
-    if root_path.exists() {
-        return Ok(root_path);
-    }
-
-    // Fallback to rootless
-    if let Ok(home) = std::env::var("HOME") {
-        return Ok(PathBuf::from(home).join(".local/share/containers/storage"));
-    }
-
-    bail!("Could not determine storage path")
-}
-
-/// Update a layer record in layers.json
-fn update_layer_record(storage_root: &std::path::Path, record: &LayerRecord) -> Result<()> {
-    let layers_json_path = storage_root.join("overlay-layers").join("layers.json");
-
-    // Read existing layers.json
-    let content = std::fs::read_to_string(&layers_json_path).unwrap_or_else(|_| "[]".to_string());
-
-    let mut layers: Vec<serde_json::Value> =
-        serde_json::from_str(&content).unwrap_or_else(|_| Vec::new());
-
-    // Find and update our layer
-    let mut found = false;
-    for layer in &mut layers {
-        if layer.get("id").and_then(|v| v.as_str()) == Some(&record.id) {
-            // Update fields
-            if let Some(diff_digest) = &record.diff_digest {
-                layer["diff-digest"] = serde_json::Value::String(diff_digest.clone());
-            }
-            if let Some(diff_size) = record.diff_size {
-                layer["diff-size"] = serde_json::Value::Number(diff_size.into());
-            }
-            if let Some(compressed_digest) = &record.compressed_diff_digest {
-                layer["compressed-diff-digest"] =
-                    serde_json::Value::String(compressed_digest.clone());
-            }
-            if let Some(compressed_size) = record.compressed_size {
-                layer["compressed-size"] = serde_json::Value::Number(compressed_size.into());
-            }
-            found = true;
-            break;
-        }
-    }
-
-    if !found {
-        bail!("Layer {} not found in layers.json", record.id);
-    }
-
-    // Write back atomically
-    let temp_path = layers_json_path.with_extension("tmp");
-    let json = serde_json::to_string_pretty(&layers)?;
-    std::fs::write(&temp_path, &json)?;
-    std::fs::rename(&temp_path, &layers_json_path)?;
-
-    Ok(())
 }

@@ -49,6 +49,8 @@ use rustix::fs::{AtFlags, Gid, Uid, ioctl_ficlone};
 use serde::{Deserialize, Serialize};
 use tar::EntryType;
 
+use oci_spec::image::Digest;
+
 use crate::error::{Result, StorageError};
 use crate::splitfdstream::{Chunk, SplitfdstreamReader};
 use crate::storage::Storage;
@@ -471,6 +473,121 @@ impl<'a> LayerStore<'a> {
         Ok((record, stats))
     }
 
+    /// Create a layer from an uncompressed tar archive.
+    ///
+    /// This method extracts the tar archive to create a new layer. It handles
+    /// all the internal details of layer creation including directory structure,
+    /// tar-split metadata, and layers.json updates.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Optional layer ID; if None, a random ID is generated
+    /// * `parent` - Optional parent layer ID
+    /// * `names` - Layer names/tags
+    /// * `tar_reader` - Reader providing the uncompressed tar archive
+    /// * `diff_digest` - Digest of the uncompressed tar (e.g., "sha256:abc...")
+    /// * `compressed_digest` - Digest of the compressed layer (e.g., "sha256:def...")
+    /// * `compressed_size` - Size of the compressed layer in bytes
+    ///
+    /// # Returns
+    ///
+    /// The created layer record with digest information populated.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cstor_rs::Storage;
+    /// use oci_spec::image::Digest;
+    /// use std::str::FromStr;
+    ///
+    /// let storage = Storage::open_writable("/var/lib/containers/storage")?;
+    /// let layer_store = storage.layer_store();
+    ///
+    /// let tar_data: &[u8] = &[/* uncompressed tar bytes */];
+    /// let diff_digest = Digest::from_str("sha256:def456...")?;
+    /// let compressed_digest = Digest::from_str("sha256:abc123...")?;
+    /// let layer = layer_store.create_layer_from_tar(
+    ///     None,
+    ///     None,
+    ///     &[],
+    ///     tar_data,
+    ///     &diff_digest,
+    ///     &compressed_digest,
+    ///     1024,
+    /// )?;
+    /// println!("Created layer: {}", layer.id);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn create_layer_from_tar<R: Read>(
+        &self,
+        id: Option<&str>,
+        parent: Option<&str>,
+        names: &[&str],
+        tar_reader: R,
+        diff_digest: &Digest,
+        compressed_digest: &Digest,
+        compressed_size: u64,
+    ) -> Result<LayerRecord> {
+        // Generate IDs
+        let layer_id = id.map(String::from).unwrap_or_else(generate_layer_id);
+        let link_id = generate_link_id();
+
+        // Validate parent exists if specified
+        if let Some(parent_id) = parent {
+            let layers = self.load_layers()?;
+            if !layers.iter().any(|l| l.id == parent_id) {
+                return Err(StorageError::LayerNotFound(parent_id.to_string()));
+            }
+        }
+
+        // Create the layer record with incomplete flag
+        let mut record = LayerRecord::new(layer_id.clone());
+        record.parent = parent.map(String::from);
+        if !names.is_empty() {
+            record.names = Some(names.iter().map(|s| s.to_string()).collect());
+        }
+        record.created = Some(chrono::Utc::now().to_rfc3339());
+        record.set_incomplete(true);
+
+        // Add to layers.json with incomplete flag
+        let mut layers = self.load_layers()?;
+        layers.push(record.clone());
+        self.save_layers(&layers)?;
+
+        // Create overlay directory structure
+        self.create_overlay_dirs(&layer_id, &link_id, parent)?;
+
+        // Get handle to the diff directory
+        let overlay_dir = self.storage.root_dir().open_dir("overlay")?;
+        let layer_dir = overlay_dir.open_dir(&layer_id)?;
+        let diff_dir = layer_dir.open_dir("diff")?;
+
+        // Extract tar to diff directory and collect TOC entries
+        let (diff_size, toc_entries) = extract_tar_to_dir(tar_reader, &diff_dir)?;
+
+        // Generate and write tar-split metadata
+        let tar_split_data = generate_tar_split(&diff_dir, &toc_entries)?;
+        let layers_dir = self.storage.root_dir().open_dir("overlay-layers")?;
+        let tar_split_name = format!("{}.tar-split.gz", layer_id);
+        layers_dir.write(&tar_split_name, &tar_split_data)?;
+
+        // Update record with digest info
+        record.diff_digest = Some(diff_digest.to_string());
+        record.diff_size = Some(diff_size as i64);
+        record.compressed_diff_digest = Some(compressed_digest.to_string());
+        record.compressed_size = Some(compressed_size as i64);
+
+        // Remove incomplete flag
+        record.set_incomplete(false);
+        let layers: Vec<LayerRecord> = layers
+            .into_iter()
+            .map(|l| if l.id == layer_id { record.clone() } else { l })
+            .collect();
+        self.save_layers(&layers)?;
+
+        Ok(record)
+    }
+
     /// Create the overlay directory structure for a layer.
     fn create_overlay_dirs(
         &self,
@@ -777,6 +894,216 @@ impl Storage {
     pub fn layer_store(&self) -> LayerStore<'_> {
         LayerStore::new(self)
     }
+}
+
+/// Extract content from a tar archive to a directory.
+///
+/// Returns the total size of extracted content and a list of TOC entries for tar-split generation.
+fn extract_tar_to_dir<R: Read>(tar_reader: R, dest: &Dir) -> Result<(u64, Vec<TocEntry>)> {
+    let mut total_size = 0u64;
+    let mut toc_entries = Vec::new();
+    let mut archive = tar::Archive::new(tar_reader);
+
+    for entry_result in archive.entries().map_err(StorageError::Io)? {
+        let mut entry = entry_result.map_err(StorageError::Io)?;
+
+        // Extract header info before borrowing entry mutably
+        let entry_type = entry.header().entry_type();
+        let mode = entry.header().mode().unwrap_or(0o644);
+        let uid = entry.header().uid().unwrap_or(0) as u32;
+        let gid = entry.header().gid().unwrap_or(0) as u32;
+        let size = entry.header().size().unwrap_or(0);
+        let link_name = entry
+            .header()
+            .link_name()
+            .ok()
+            .flatten()
+            .map(|c| c.into_owned());
+        let path = entry.path().map_err(StorageError::Io)?.into_owned();
+
+        // Normalize path
+        let normalized_path: PathBuf = path.strip_prefix("./").unwrap_or(&path).to_path_buf();
+
+        if normalized_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        // Check for whiteouts - these create special overlay markers
+        if let Some(filename) = normalized_path.file_name().and_then(|f| f.to_str()) {
+            if filename == OPAQUE_WHITEOUT {
+                // Opaque whiteout: create the marker file
+                if let Some(parent) = normalized_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                {
+                    dest.create_dir_all(parent).map_err(StorageError::Io)?;
+                }
+                dest.create(&normalized_path)
+                    .map_err(StorageError::Io)?;
+                continue;
+            } else if let Some(target) = filename.strip_prefix(WHITEOUT_PREFIX) {
+                // Regular whiteout: create .wh.<name> marker
+                if let Some(parent) = normalized_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                {
+                    dest.create_dir_all(parent).map_err(StorageError::Io)?;
+                }
+                let whiteout_path = if let Some(parent) = normalized_path.parent() {
+                    parent.join(format!(".wh.{}", target))
+                } else {
+                    PathBuf::from(format!(".wh.{}", target))
+                };
+                dest.create(&whiteout_path).map_err(StorageError::Io)?;
+                continue;
+            }
+        }
+
+        // Create parent directories
+        if let Some(parent) = normalized_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            dest.create_dir_all(parent).map_err(StorageError::Io)?;
+        }
+
+        match entry_type {
+            EntryType::Directory => {
+                match dest.create_dir(&normalized_path) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(StorageError::Io(e)),
+                }
+                let perms = Permissions::from_mode(mode);
+                let _ = dest.set_permissions(&normalized_path, perms);
+                let _ = rustix::fs::chownat(
+                    dest,
+                    &normalized_path,
+                    Some(Uid::from_raw(uid)),
+                    Some(Gid::from_raw(gid)),
+                    AtFlags::empty(),
+                );
+                toc_entries.push(TocEntry {
+                    name: normalized_path,
+                    entry_type: TocEntryType::Dir,
+                    size: None,
+                    modtime: None,
+                    link_name: None,
+                    mode,
+                    uid,
+                    gid,
+                    user_name: None,
+                    group_name: None,
+                    dev_major: None,
+                    dev_minor: None,
+                    xattrs: None,
+                    digest: None,
+                });
+            }
+            EntryType::Symlink => {
+                if let Some(ref target) = link_name {
+                    let _ = dest.remove_file(&normalized_path);
+                    dest.symlink(target, &normalized_path)
+                        .map_err(StorageError::Io)?;
+                    let _ = rustix::fs::chownat(
+                        dest,
+                        &normalized_path,
+                        Some(Uid::from_raw(uid)),
+                        Some(Gid::from_raw(gid)),
+                        AtFlags::SYMLINK_NOFOLLOW,
+                    );
+                    toc_entries.push(TocEntry {
+                        name: normalized_path,
+                        entry_type: TocEntryType::Symlink,
+                        size: None,
+                        modtime: None,
+                        link_name: Some(target.to_string_lossy().to_string()),
+                        mode: 0o777,
+                        uid,
+                        gid,
+                        user_name: None,
+                        group_name: None,
+                        dev_major: None,
+                        dev_minor: None,
+                        xattrs: None,
+                        digest: None,
+                    });
+                }
+            }
+            EntryType::Link => {
+                if let Some(ref target) = link_name {
+                    let target_path: PathBuf =
+                        target.strip_prefix("./").unwrap_or(target).to_path_buf();
+                    let _ = dest.remove_file(&normalized_path);
+                    dest.hard_link(&target_path, dest, &normalized_path)
+                        .map_err(StorageError::Io)?;
+                    toc_entries.push(TocEntry {
+                        name: normalized_path,
+                        entry_type: TocEntryType::Hardlink,
+                        size: None,
+                        modtime: None,
+                        link_name: Some(target.to_string_lossy().to_string()),
+                        mode,
+                        uid,
+                        gid,
+                        user_name: None,
+                        group_name: None,
+                        dev_major: None,
+                        dev_minor: None,
+                        xattrs: None,
+                        digest: None,
+                    });
+                }
+            }
+            EntryType::Regular | EntryType::Continuous => {
+                let _ = dest.remove_file(&normalized_path);
+
+                let mut dest_file = dest
+                    .open_with(
+                        &normalized_path,
+                        OpenOptions::new().write(true).create(true).truncate(true),
+                    )
+                    .map_err(StorageError::Io)?
+                    .into_std();
+                std::io::copy(&mut entry, &mut dest_file).map_err(StorageError::Io)?;
+                total_size += size;
+
+                let perms = Permissions::from_mode(mode);
+                let _ = dest.set_permissions(&normalized_path, perms);
+                let _ = rustix::fs::chownat(
+                    dest,
+                    &normalized_path,
+                    Some(Uid::from_raw(uid)),
+                    Some(Gid::from_raw(gid)),
+                    AtFlags::empty(),
+                );
+                toc_entries.push(TocEntry {
+                    name: normalized_path,
+                    entry_type: TocEntryType::Reg,
+                    size: Some(size),
+                    modtime: None,
+                    link_name: None,
+                    mode,
+                    uid,
+                    gid,
+                    user_name: None,
+                    group_name: None,
+                    dev_major: None,
+                    dev_minor: None,
+                    xattrs: None,
+                    digest: None,
+                });
+            }
+            EntryType::Char | EntryType::Block | EntryType::Fifo => {
+                // Skip device files - can't create as unprivileged user
+            }
+            _ => {
+                // Skip other entry types
+            }
+        }
+    }
+
+    Ok((total_size, toc_entries))
 }
 
 /// Extract content from a splitfdstream to a directory.
