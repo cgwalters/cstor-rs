@@ -33,6 +33,8 @@ jsonrpc-fdpass.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 xshell.workspace = true
+oci-client.workspace = true
+futures-util.workspace = true
 
 [[bin]]
 name = "cstor-rs"

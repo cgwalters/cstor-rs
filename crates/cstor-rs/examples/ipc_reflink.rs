@@ -63,7 +63,9 @@ async fn main() -> Result<()> {
     println!("Found image: {}", image.id());
 
     // Get storage layer IDs (resolved from diff_ids via layers.json)
-    let layer_ids = image.storage_layer_ids(&storage).context("Failed to get layers")?;
+    let layer_ids = image
+        .storage_layer_ids(&storage)
+        .context("Failed to get layers")?;
     println!("Image has {} layer(s)", layer_ids.len());
 
     // Create destination directory
