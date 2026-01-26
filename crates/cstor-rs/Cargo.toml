@@ -35,6 +35,7 @@ tempfile.workspace = true
 xshell.workspace = true
 oci-client.workspace = true
 futures-util.workspace = true
+zstd.workspace = true
 
 [[bin]]
 name = "cstor-rs"

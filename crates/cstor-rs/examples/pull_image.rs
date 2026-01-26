@@ -27,6 +27,7 @@ use oci_client::manifest::{OciDescriptor, OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
 use oci_spec::image::ImageConfiguration;
 use sha2::{Digest, Sha256};
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 /// Default platform to select for multi-arch images
 const DEFAULT_OS: &str = "linux";
@@ -416,22 +417,30 @@ fn decompress_layer(data: &[u8], media_type: &str) -> Result<Vec<u8>> {
             .context("Failed to decompress gzip layer")?;
         Ok(decompressed)
     } else if media_type.contains("zstd") || media_type.ends_with("+zstd") {
-        // Zstd compressed - not implemented
-        bail!(
-            "Zstd decompression not implemented. \
-             Add 'zstd' crate to Cargo.toml to support zstd-compressed layers."
-        );
+        // Zstd compressed
+        let mut decoder = ZstdDecoder::new(data).context("Failed to create zstd decoder")?;
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .context("Failed to decompress zstd layer")?;
+        Ok(decompressed)
     } else if media_type.contains("tar") && !media_type.contains('+') {
         // Uncompressed tar
         Ok(data.to_vec())
     } else {
-        // Try gzip first (most common), fall back to uncompressed
-        match GzDecoder::new(data)
-            .bytes()
-            .collect::<std::io::Result<Vec<u8>>>()
-        {
-            Ok(decompressed) => Ok(decompressed),
-            Err(_) => Ok(data.to_vec()),
+        // Try gzip first (most common), then zstd, fall back to uncompressed
+        if let Ok(mut decoder) = ZstdDecoder::new(data) {
+            let mut decompressed = Vec::new();
+            if decoder.read_to_end(&mut decompressed).is_ok() {
+                return Ok(decompressed);
+            }
+        }
+        // Try gzip
+        let mut decoder = GzDecoder::new(data);
+        let mut decompressed = Vec::new();
+        match decoder.read_to_end(&mut decompressed) {
+            Ok(_) if !decompressed.is_empty() => Ok(decompressed),
+            _ => Ok(data.to_vec()), // Fall back to raw data
         }
     }
 }
