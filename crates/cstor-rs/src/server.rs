@@ -24,7 +24,7 @@
 //! let layer = Layer::open(&storage, "layer-id")?;
 //!
 //! let (server_sock, client_sock) = UnixStream::pair()?;
-//! let mut server = TarSplitServer::new(server_sock)?;
+//! let mut server = TarSplitServer::new(server_sock);
 //!
 //! // Stream the layer (async)
 //! server.stream_layer(&storage, &layer).await?;
@@ -64,13 +64,11 @@ impl TarSplitServer {
     ///
     /// # Errors
     ///
-    /// Returns an error if the socket cannot be converted to a transport.
-    pub fn new(socket: UnixStream) -> Result<Self> {
-        let transport = UnixSocketTransport::new(socket).map_err(|e| {
-            StorageError::TarSplitError(format!("Failed to create transport: {}", e))
-        })?;
+    /// Create a new server from a Unix socket.
+    pub fn new(socket: UnixStream) -> Self {
+        let transport = UnixSocketTransport::new(socket);
         let (sender, _receiver) = transport.split();
-        Ok(Self { sender })
+        Self { sender }
     }
 
     /// Stream a layer's tar-split data with file descriptors.
@@ -160,7 +158,7 @@ impl TarSplitServer {
 /// # async fn example() -> Result<(), cstor_rs::StorageError> {
 /// let storage = Storage::discover()?;
 /// let (server_sock, client_sock) = UnixStream::pair()?;
-/// let mut server = RpcServer::new(server_sock, storage)?;
+/// let mut server = RpcServer::new(server_sock, storage);
 ///
 /// // Run the server (processes requests until connection closes)
 /// server.run().await?;
@@ -184,17 +182,15 @@ impl RpcServer {
     ///
     /// # Errors
     ///
-    /// Returns an error if the socket cannot be converted to a transport.
-    pub fn new(socket: UnixStream, storage: Storage) -> Result<Self> {
-        let transport = UnixSocketTransport::new(socket).map_err(|e| {
-            StorageError::TarSplitError(format!("Failed to create transport: {}", e))
-        })?;
+    /// Create a new RPC server from a Unix socket.
+    pub fn new(socket: UnixStream, storage: Storage) -> Self {
+        let transport = UnixSocketTransport::new(socket);
         let (sender, receiver) = transport.split();
-        Ok(Self {
+        Self {
             sender,
             receiver,
             storage,
-        })
+        }
     }
 
     /// Run the server, processing requests until the connection closes.
@@ -419,7 +415,7 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             // We need a Storage but for this test we'll just check method routing
             // Since we can't easily mock Storage, we'll test the transport layer
-            let transport = UnixSocketTransport::new(sock_a).unwrap();
+            let transport = UnixSocketTransport::new(sock_a);
             let (mut sender, mut receiver) = transport.split();
 
             // Receive request
@@ -440,7 +436,7 @@ mod tests {
         });
 
         // Client side
-        let transport = UnixSocketTransport::new(sock_b).unwrap();
+        let transport = UnixSocketTransport::new(sock_b);
         let (mut sender, mut receiver) = transport.split();
 
         // Send unknown method request
@@ -471,7 +467,7 @@ mod tests {
 
         // Simulate server behavior for invalid params
         let server_handle = tokio::spawn(async move {
-            let transport = UnixSocketTransport::new(sock_a).unwrap();
+            let transport = UnixSocketTransport::new(sock_a);
             let (mut sender, mut receiver) = transport.split();
 
             let msg = receiver.receive().await.unwrap();
@@ -491,7 +487,7 @@ mod tests {
         });
 
         // Client side
-        let transport = UnixSocketTransport::new(sock_b).unwrap();
+        let transport = UnixSocketTransport::new(sock_b);
         let (mut sender, mut receiver) = transport.split();
 
         // Send request with invalid params (empty object, missing "layer")

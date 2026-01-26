@@ -1149,15 +1149,13 @@ fn export_layer_ipc(storage: &Storage, layer_ref: &str, output: Option<PathBuf>)
             rt.block_on(async move {
                 let server_storage =
                     Storage::discover().expect("Failed to discover storage in server task");
-                let mut server = RpcServer::new(server_sock, server_storage)
-                    .expect("Failed to create RpcServer");
+                let mut server = RpcServer::new(server_sock, server_storage);
                 server.run().await.expect("Server failed");
             });
         });
 
         // Client side: create transport and send request
-        let transport = UnixSocketTransport::new(client_sock)
-            .map_err(|e| anyhow!("Failed to create client transport: {}", e))?;
+        let transport = UnixSocketTransport::new(client_sock);
         let (mut sender, mut receiver) = transport.split();
 
         // Send GetLayerSplitfdstream request

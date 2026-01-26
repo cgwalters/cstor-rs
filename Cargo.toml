@@ -57,7 +57,7 @@ facet = { version = "0.43", features = ["reflect"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 tracing = "0.1"
 tokio = { version = "1.40", features = ["full"] }
-jsonrpc-fdpass = { git = "https://github.com/cgwalters/jsonrpc-fdpass", rev = "c8b4aa54afa433541d83f1cb5436b44842a21e68" }
+jsonrpc-fdpass = { git = "https://github.com/cgwalters/jsonrpc-fdpass", rev = "b30fa1d" }
 
 # Dev/test dependencies
 tempfile = "3.0"

@@ -20,7 +20,7 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let stream = UnixStream::connect("/run/skopeo-proxy.sock").await?;
-//! let mut client = ProxyV2Client::connect(stream).await?;
+//! let mut client = ProxyV2Client::connect(stream);
 //!
 //! // Initialize and check capabilities
 //! let init = client.initialize().await?;
@@ -236,18 +236,16 @@ impl ProxyV2Client {
     ///
     /// # Errors
     ///
-    /// Returns an error if the socket cannot be set up for transport.
-    pub async fn connect(socket: UnixStream) -> Result<Self> {
-        let transport = UnixSocketTransport::new(socket).map_err(|e| {
-            StorageError::TarSplitError(format!("Failed to create transport: {}", e))
-        })?;
+    /// Create a new proxy client from a Unix socket.
+    pub fn connect(socket: UnixStream) -> Self {
+        let transport = UnixSocketTransport::new(socket);
         let (sender, receiver) = transport.split();
 
-        Ok(Self {
+        Self {
             sender,
             receiver,
             request_id: 0,
-        })
+        }
     }
 
     /// Get the next request ID.
@@ -668,7 +666,7 @@ mod tests {
 
         // Server side
         let server_handle = tokio::spawn(async move {
-            let transport = UnixSocketTransport::new(sock_a).unwrap();
+            let transport = UnixSocketTransport::new(sock_a);
             let (mut sender, mut receiver) = transport.split();
 
             // Receive Initialize request
@@ -694,7 +692,7 @@ mod tests {
         });
 
         // Client side
-        let mut client = ProxyV2Client::connect(sock_b).await.unwrap();
+        let mut client = ProxyV2Client::connect(sock_b);
         let result = client.initialize().await.unwrap();
 
         assert_eq!(result.version, "2.0.0");
@@ -709,7 +707,7 @@ mod tests {
 
         // Server side
         let server_handle = tokio::spawn(async move {
-            let transport = UnixSocketTransport::new(sock_a).unwrap();
+            let transport = UnixSocketTransport::new(sock_a);
             let (mut sender, mut receiver) = transport.split();
 
             let msg = receiver.receive().await.unwrap();
@@ -729,7 +727,7 @@ mod tests {
             }
         });
 
-        let mut client = ProxyV2Client::connect(sock_b).await.unwrap();
+        let mut client = ProxyV2Client::connect(sock_b);
         let image_id = client
             .open_image("containers-storage:test:latest")
             .await
@@ -746,7 +744,7 @@ mod tests {
 
         // Server side
         let server_handle = tokio::spawn(async move {
-            let transport = UnixSocketTransport::new(sock_a).unwrap();
+            let transport = UnixSocketTransport::new(sock_a);
             let (mut sender, mut receiver) = transport.split();
 
             // Receive GetLayerTarSplit request
@@ -810,7 +808,7 @@ mod tests {
         });
 
         // Client side
-        let mut client = ProxyV2Client::connect(sock_b).await.unwrap();
+        let mut client = ProxyV2Client::connect(sock_b);
         let mut stream = client
             .get_layer_tar_split(1, "sha256:abc123")
             .await

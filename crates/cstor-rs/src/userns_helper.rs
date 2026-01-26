@@ -386,8 +386,7 @@ async fn run_helper_loop_async(std_socket: StdUnixStream) -> std::result::Result
     let tokio_socket = TokioUnixStream::from_std(std_socket)
         .map_err(|e| HelperError::Ipc(format!("failed to convert socket: {}", e)))?;
 
-    let transport = UnixSocketTransport::new(tokio_socket)
-        .map_err(|e| HelperError::Ipc(format!("failed to create transport: {}", e)))?;
+    let transport = UnixSocketTransport::new(tokio_socket);
     let (mut sender, mut receiver) = transport.split();
 
     tracing::debug!("userns helper: starting request loop");
@@ -1030,8 +1029,7 @@ impl StorageProxy {
         let tokio_socket = TokioUnixStream::from_std(parent_sock)
             .map_err(|e| HelperError::Ipc(format!("failed to convert socket: {}", e)))?;
 
-        let transport = UnixSocketTransport::new(tokio_socket)
-            .map_err(|e| HelperError::Ipc(format!("failed to create transport: {}", e)))?;
+        let transport = UnixSocketTransport::new(tokio_socket);
         let (sender, receiver) = transport.split();
 
         Ok(Self {

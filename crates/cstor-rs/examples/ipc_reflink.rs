@@ -124,8 +124,7 @@ async fn extract_layer_via_ipc(
 
     // Spawn server task
     let server_task = tokio::spawn(async move {
-        let transport = UnixSocketTransport::new(server_sock)
-            .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?;
+        let transport = UnixSocketTransport::new(server_sock);
         let (mut sender, _receiver) = transport.split();
 
         // Send start message
@@ -191,7 +190,7 @@ async fn extract_layer_via_ipc(
     });
 
     // Client side: receive and reflink
-    let mut client = TarSplitClient::new(client_sock).context("Failed to create TarSplitClient")?;
+    let mut client = TarSplitClient::new(client_sock);
 
     let mut reflinked = 0;
     let mut copied = 0;
