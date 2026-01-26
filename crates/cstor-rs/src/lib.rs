@@ -89,6 +89,7 @@ pub mod tar_writer;
 pub mod toc;
 
 // Layer creation and management
+pub mod image_store;
 pub mod layer_builder;
 pub mod layer_store;
 
@@ -135,6 +136,7 @@ pub use tar_writer::{write_file_data, write_tar_footer, write_tar_header};
 pub use toc::{Toc, TocEntry, TocEntryType};
 
 // Layer creation and management exports
+pub use image_store::{ImageRecord, ImageStore};
 pub use layer_builder::LayerBuilder;
 pub use layer_store::{
     IdMapping, ImportOptions, ImportStats, LayerRecord, LayerStore, generate_layer_id,
