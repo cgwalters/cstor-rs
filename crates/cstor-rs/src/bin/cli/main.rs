@@ -784,6 +784,63 @@ fn output_toc(storage: &Storage, image_id: &str, pretty: bool) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a layer reference to a full layer ID.
+///
+/// This handles short IDs, link IDs, and full IDs.
+fn resolve_layer_id(storage: &Storage, layer_ref: &str) -> Result<String> {
+    // First try direct ID lookup (full ID)
+    if Layer::open(storage, layer_ref).is_ok() {
+        return Ok(layer_ref.to_string());
+    }
+
+    // Try resolving as a link ID (base32, 26 chars)
+    if layer_ref.len() == 26
+        && layer_ref.chars().all(|c| c.is_ascii_alphanumeric())
+        && let Ok(layer_id) = storage.resolve_link(layer_ref)
+        && Layer::open(storage, &layer_id).is_ok()
+    {
+        return Ok(layer_id);
+    }
+
+    // Try prefix matching on layer IDs
+    if layer_ref.len() >= 3 {
+        let overlay_dir = storage
+            .root_dir()
+            .open_dir("overlay")
+            .context("Failed to open overlay directory")?;
+
+        let mut matches: Vec<String> = Vec::new();
+        for entry in overlay_dir
+            .entries()
+            .context("Failed to read overlay directory")?
+        {
+            let entry = entry.context("Failed to read directory entry")?;
+            if entry.file_type()?.is_dir() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                // Skip the 'l' directory (link directory)
+                if name_str != "l" && name_str.starts_with(layer_ref) {
+                    matches.push(name_str.to_string());
+                }
+            }
+        }
+
+        match matches.len() {
+            1 => return Ok(matches.into_iter().next().unwrap()),
+            n if n > 1 => {
+                anyhow::bail!(
+                    "ambiguous layer ID prefix '{}' matches {} layers",
+                    layer_ref,
+                    n
+                );
+            }
+            _ => {}
+        }
+    }
+
+    anyhow::bail!("layer not found: {}", layer_ref)
+}
+
 /// Extract a layer to a directory using ProxiedStorage.
 ///
 /// Uses the ProxiedStorage API for transparent access in both privileged
@@ -828,6 +885,13 @@ fn extract_layer_cmd(
         None => discover_storage_path()?,
     };
 
+    // First resolve the layer reference to a full ID using read-only storage access
+    // This allows short IDs and link IDs to work
+    let layer_id = {
+        let storage = Storage::open(&storage_path).context("Failed to open storage for lookup")?;
+        resolve_layer_id(&storage, layer_ref)?
+    };
+
     // Create tokio runtime for async ProxiedStorage operations
     let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
 
@@ -843,11 +907,11 @@ fn extract_layer_cmd(
             eprintln!("Using proxied storage via userns helper");
         }
 
-        eprintln!("Extracting layer {} to {}", layer_ref, dest.display());
+        eprintln!("Extracting layer {} to {}", layer_id, dest.display());
 
         // Extract the layer
         let stats = storage
-            .extract_layer(layer_ref, &dest_dir, &options)
+            .extract_layer(&layer_id, &dest_dir, &options)
             .await
             .map_err(|e| anyhow!("Extraction failed: {}", e))?;
 

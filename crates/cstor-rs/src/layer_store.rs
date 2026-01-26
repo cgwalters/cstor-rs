@@ -385,7 +385,7 @@ impl<'a> LayerStore<'a> {
     /// # Example
     ///
     /// ```no_run
-    /// use cstor_rs::{Storage, LayerStore};
+    /// use cstor_rs::{ImportOptions, Storage, LayerStore};
     /// use std::fs::File;
     ///
     /// let storage = Storage::open_writable("/var/lib/containers/storage")?;
