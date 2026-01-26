@@ -2,6 +2,7 @@
 name = "cstor-rs"
 version.workspace = true
 edition.workspace = true
+default-run = "cstor-rs"
 
 [dependencies]
 cap-std.workspace = true
