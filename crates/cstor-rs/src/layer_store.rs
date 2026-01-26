@@ -97,13 +97,15 @@ pub struct LayerRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compression: Option<i32>,
 
-    /// UID mappings for user namespace support.
+    /// UIDs present in this layer (for user namespace support).
+    /// This is a simple list of UIDs found in the layer's files.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub uidset: Option<Vec<IdMapping>>,
+    pub uidset: Option<Vec<u32>>,
 
-    /// GID mappings for user namespace support.
+    /// GIDs present in this layer (for user namespace support).
+    /// This is a simple list of GIDs found in the layer's files.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gidset: Option<Vec<IdMapping>>,
+    pub gidset: Option<Vec<u32>>,
 
     /// Flags for layer state (e.g., "incomplete" during creation).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,6 +117,13 @@ pub struct LayerRecord {
 }
 
 /// ID mapping for user namespace support.
+///
+/// This represents a range mapping from container IDs to host IDs,
+/// used when running containers in user namespaces.
+///
+/// Note: The `uidset`/`gidset` fields in `LayerRecord` are simple UID/GID
+/// lists, not IdMapping arrays. This struct is provided for compatibility
+/// with other containers/storage APIs that use the full mapping format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct IdMapping {
