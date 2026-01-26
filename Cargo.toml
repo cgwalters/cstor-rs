@@ -31,7 +31,7 @@ cstor-rs = { path = "crates/cstor-rs" }
 
 # Core dependencies
 cap-std = "3.0"
-cap-std-ext = "4.0.6"
+cap-std-ext = "4.0.7"
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2.0"
 anyhow = "1.0"

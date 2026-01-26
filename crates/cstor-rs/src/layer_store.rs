@@ -45,7 +45,8 @@ use std::os::unix::fs::PermissionsExt as StdPermissionsExt;
 use std::path::PathBuf;
 
 use cap_std::fs::{Dir, OpenOptions, Permissions, PermissionsExt};
-use rustix::fs::{AtFlags, Gid, Uid, ioctl_ficlone};
+use cap_std_ext::dirext::CapStdExtDirExt;
+use rustix::fs::{AtFlags, FileType, Gid, Mode, Uid, ioctl_ficlone, mknodat};
 use serde::{Deserialize, Serialize};
 use tar::EntryType;
 
@@ -231,6 +232,66 @@ const WHITEOUT_PREFIX: &str = ".wh.";
 
 /// Opaque whiteout marker filename.
 const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
+
+/// PAX extended header prefix for xattrs (SCHILY.xattr.).
+const PAX_SCHILY_XATTR: &str = "SCHILY.xattr.";
+
+/// Extract xattrs from a tar entry's PAX extensions.
+///
+/// Returns a HashMap of xattr name -> value for xattrs we care about.
+/// Currently we extract:
+/// - `security.capability` - file capabilities (e.g., for ping, sudo)
+///
+/// Other xattrs in the `security.*` namespace may require CAP_SYS_ADMIN
+/// to set, so we handle errors gracefully.
+fn extract_xattrs_from_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+) -> std::collections::HashMap<String, Vec<u8>> {
+    let mut xattrs = std::collections::HashMap::new();
+
+    // Try to get PAX extensions
+    let pax_extensions = match entry.pax_extensions() {
+        Ok(Some(exts)) => exts,
+        _ => return xattrs,
+    };
+
+    for ext in pax_extensions {
+        let ext = match ext {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        // Check if this is an xattr (SCHILY.xattr.*)
+        let key = match ext.key() {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+
+        if let Some(xattr_name) = key.strip_prefix(PAX_SCHILY_XATTR) {
+            // Only extract security.capability for now
+            // Other security.* xattrs often require CAP_SYS_ADMIN
+            if xattr_name == "security.capability" {
+                xattrs.insert(xattr_name.to_string(), ext.value_bytes().to_vec());
+            }
+        }
+    }
+
+    xattrs
+}
+
+/// Apply xattrs to a file.
+///
+/// Logs and ignores errors since xattr operations may fail due to:
+/// - Filesystem not supporting xattrs
+/// - Missing capabilities (e.g., CAP_SETFCAP for security.capability)
+/// - User namespace restrictions
+fn apply_xattrs(dest: &Dir, path: &std::path::Path, xattrs: &std::collections::HashMap<String, Vec<u8>>) {
+    for (name, value) in xattrs {
+        if let Err(e) = dest.setxattr(path, name.as_str(), value) {
+            tracing::debug!("Failed to set xattr {} on {:?}: {}", name, path, e);
+        }
+    }
+}
 
 /// Generate a random 64-character hex layer ID.
 ///
@@ -907,6 +968,9 @@ fn extract_tar_to_dir<R: Read>(tar_reader: R, dest: &Dir) -> Result<(u64, Vec<To
     for entry_result in archive.entries().map_err(StorageError::Io)? {
         let mut entry = entry_result.map_err(StorageError::Io)?;
 
+        // Extract xattrs from PAX headers before other operations
+        let xattrs = extract_xattrs_from_entry(&mut entry);
+
         // Extract header info before borrowing entry mutably
         let entry_type = entry.header().entry_type();
         let mode = entry.header().mode().unwrap_or(0o644);
@@ -1077,6 +1141,12 @@ fn extract_tar_to_dir<R: Read>(tar_reader: R, dest: &Dir) -> Result<(u64, Vec<To
                     Some(Gid::from_raw(gid)),
                     AtFlags::empty(),
                 );
+
+                // Apply xattrs (e.g., security.capability)
+                if !xattrs.is_empty() {
+                    apply_xattrs(dest, &normalized_path, &xattrs);
+                }
+
                 toc_entries.push(TocEntry {
                     name: normalized_path,
                     entry_type: TocEntryType::Reg,
@@ -1094,8 +1164,42 @@ fn extract_tar_to_dir<R: Read>(tar_reader: R, dest: &Dir) -> Result<(u64, Vec<To
                     digest: None,
                 });
             }
-            EntryType::Char | EntryType::Block | EntryType::Fifo => {
-                // Skip device files - can't create as unprivileged user
+            EntryType::Fifo => {
+                // FIFOs can be created by unprivileged users
+                let _ = dest.remove_file(&normalized_path);
+                // mknodat with FileType::Fifo and dev=0
+                let file_mode = Mode::from_raw_mode(mode);
+                if let Err(e) = mknodat(dest, &normalized_path, FileType::Fifo, file_mode, 0) {
+                    // Log but continue - FIFO creation might fail in some environments
+                    tracing::debug!("Failed to create FIFO {:?}: {}", normalized_path, e);
+                } else {
+                    let _ = rustix::fs::chownat(
+                        dest,
+                        &normalized_path,
+                        Some(Uid::from_raw(uid)),
+                        Some(Gid::from_raw(gid)),
+                        AtFlags::empty(),
+                    );
+                    toc_entries.push(TocEntry {
+                        name: normalized_path,
+                        entry_type: TocEntryType::Fifo,
+                        size: None,
+                        modtime: None,
+                        link_name: None,
+                        mode,
+                        uid,
+                        gid,
+                        user_name: None,
+                        group_name: None,
+                        dev_major: None,
+                        dev_minor: None,
+                        xattrs: None,
+                        digest: None,
+                    });
+                }
+            }
+            EntryType::Char | EntryType::Block => {
+                // Skip device files - requires CAP_MKNOD
             }
             _ => {
                 // Skip other entry types
@@ -1153,6 +1257,9 @@ fn extract_splitfdstream_to_dir<R: Read>(
 
     for entry_result in archive.entries().map_err(StorageError::Io)? {
         let mut entry = entry_result.map_err(StorageError::Io)?;
+
+        // Extract xattrs from PAX headers before other operations
+        let xattrs = extract_xattrs_from_entry(&mut entry);
 
         // Extract header info before borrowing entry mutably
         let entry_type = entry.header().entry_type();
@@ -1348,6 +1455,12 @@ fn extract_splitfdstream_to_dir<R: Read>(
                         AtFlags::empty(),
                     );
                 }
+
+                // Apply xattrs (e.g., security.capability)
+                if !xattrs.is_empty() {
+                    apply_xattrs(dest, &normalized_path, &xattrs);
+                }
+
                 stats.files_imported += 1;
                 toc_entries.push(TocEntry {
                     name: normalized_path,
@@ -1366,8 +1479,43 @@ fn extract_splitfdstream_to_dir<R: Read>(
                     digest: None,
                 });
             }
-            EntryType::Char | EntryType::Block | EntryType::Fifo => {
-                // Skip device files - can't create as unprivileged user
+            EntryType::Fifo => {
+                // FIFOs can be created by unprivileged users
+                let _ = dest.remove_file(&normalized_path);
+                let file_mode = Mode::from_raw_mode(mode);
+                if let Err(e) = mknodat(dest, &normalized_path, FileType::Fifo, file_mode, 0) {
+                    tracing::debug!("Failed to create FIFO {:?}: {}", normalized_path, e);
+                    stats.entries_skipped += 1;
+                } else {
+                    if options.preserve_ownership {
+                        let _ = rustix::fs::chownat(
+                            dest,
+                            &normalized_path,
+                            Some(Uid::from_raw(uid)),
+                            Some(Gid::from_raw(gid)),
+                            AtFlags::empty(),
+                        );
+                    }
+                    toc_entries.push(TocEntry {
+                        name: normalized_path,
+                        entry_type: TocEntryType::Fifo,
+                        size: None,
+                        modtime: None,
+                        link_name: None,
+                        mode,
+                        uid,
+                        gid,
+                        user_name: None,
+                        group_name: None,
+                        dev_major: None,
+                        dev_minor: None,
+                        xattrs: None,
+                        digest: None,
+                    });
+                }
+            }
+            EntryType::Char | EntryType::Block => {
+                // Skip device files - requires CAP_MKNOD
                 stats.entries_skipped += 1;
             }
             _ => {
