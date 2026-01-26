@@ -146,7 +146,9 @@ pub use tar_split_writer::TarSplitWriter;
 
 // Layer extraction exports
 pub use extract::{
-    ExtractionOptions, ExtractionStats, extract_image, extract_image_with_toc, extract_layer,
+    AllowAllHardlinks, DefaultHardlinkFilter, DenyAllHardlinks, ExtractionOptions,
+    ExtractionStats, HardlinkFilter, LinkMode, extract_image, extract_image_with_toc,
+    extract_layer, HARDLINK_MIN_SIZE_LARGE, HARDLINK_MIN_SIZE_SMALL,
 };
 
 // Re-export OCI spec types for convenience

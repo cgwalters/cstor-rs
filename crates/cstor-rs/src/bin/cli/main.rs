@@ -148,9 +148,15 @@ enum ImageCommands {
         image: String,
         /// Destination directory (must not exist)
         output: PathBuf,
-        /// Disable reflinks and always copy file data
+        /// Link mode for file extraction
+        #[arg(long, value_enum, default_value = "reflink")]
+        link_mode: CliLinkMode,
+        /// Fall back to copying if reflink/hardlink fails (e.g., cross-filesystem)
+        ///
+        /// By default, extraction will fail if the requested link mode is not
+        /// supported. Use this flag to silently fall back to copying instead.
         #[arg(long)]
-        no_reflinks: bool,
+        fallback_to_copy: bool,
         /// Preserve file ownership (UID/GID) - requires privileges
         #[arg(long)]
         preserve_ownership: bool,
@@ -158,6 +164,28 @@ enum ImageCommands {
         #[arg(long)]
         no_permissions: bool,
     },
+}
+
+/// Link mode for file extraction (CLI enum).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum CliLinkMode {
+    /// Use reflinks (copy-on-write) - best for btrfs/XFS
+    #[default]
+    Reflink,
+    /// Use hardlinks to source files - works on ext4
+    Hardlink,
+    /// Always copy file data
+    Copy,
+}
+
+impl From<CliLinkMode> for cstor_rs::extract::LinkMode {
+    fn from(mode: CliLinkMode) -> Self {
+        match mode {
+            CliLinkMode::Reflink => cstor_rs::extract::LinkMode::Reflink,
+            CliLinkMode::Hardlink => cstor_rs::extract::LinkMode::Hardlink,
+            CliLinkMode::Copy => cstor_rs::extract::LinkMode::Copy,
+        }
+    }
 }
 
 /// Layer subcommands
@@ -209,9 +237,15 @@ enum LayerCommands {
         layer: String,
         /// Destination directory (must not exist)
         output: PathBuf,
-        /// Disable reflinks and always copy file data
+        /// Link mode for file extraction
+        #[arg(long, value_enum, default_value = "reflink")]
+        link_mode: CliLinkMode,
+        /// Fall back to copying if reflink/hardlink fails (e.g., cross-filesystem)
+        ///
+        /// By default, extraction will fail if the requested link mode is not
+        /// supported. Use this flag to silently fall back to copying instead.
         #[arg(long)]
-        no_reflinks: bool,
+        fallback_to_copy: bool,
         /// Preserve file ownership (UID/GID) - requires privileges
         #[arg(long)]
         preserve_ownership: bool,
@@ -251,14 +285,16 @@ fn main() -> Result<()> {
             ImageCommands::Extract {
                 image,
                 output,
-                no_reflinks,
+                link_mode,
+                fallback_to_copy,
                 preserve_ownership,
                 no_permissions,
             } => extract_image_cmd(
                 &cli.root,
                 &image,
                 output,
-                no_reflinks,
+                link_mode,
+                fallback_to_copy,
                 preserve_ownership,
                 no_permissions,
             )?,
@@ -276,14 +312,16 @@ fn main() -> Result<()> {
             LayerCommands::Extract {
                 layer,
                 output,
-                no_reflinks,
+                link_mode,
+                fallback_to_copy,
                 preserve_ownership,
                 no_permissions,
             } => extract_layer_cmd(
                 &cli.root,
                 &layer,
                 output,
-                no_reflinks,
+                link_mode,
+                fallback_to_copy,
                 preserve_ownership,
                 no_permissions,
             )?,
@@ -849,7 +887,8 @@ fn extract_layer_cmd(
     storage_root: &Option<PathBuf>,
     layer_ref: &str,
     dest: PathBuf,
-    no_reflinks: bool,
+    link_mode: CliLinkMode,
+    fallback_to_copy: bool,
     preserve_ownership: bool,
     no_permissions: bool,
 ) -> Result<()> {
@@ -871,9 +910,17 @@ fn extract_layer_cmd(
     let dest_dir = Dir::open_ambient_dir(&dest, ambient_authority())
         .context("Failed to open destination directory")?;
 
-    // Build extraction options
+    // Build extraction options with appropriate hardlink filter
+    let hardlink_filter = match link_mode {
+        CliLinkMode::Hardlink => Some(std::sync::Arc::new(
+            cstor_rs::extract::DefaultHardlinkFilter,
+        ) as std::sync::Arc<dyn cstor_rs::extract::HardlinkFilter>),
+        _ => None,
+    };
     let options = ExtractionOptions {
-        use_reflinks: !no_reflinks,
+        link_mode: link_mode.into(),
+        fallback_to_copy,
+        hardlink_filter,
         preserve_ownership,
         preserve_permissions: !no_permissions,
         process_whiteouts: true,
@@ -934,16 +981,27 @@ fn extract_layer_cmd(
             );
         }
         eprintln!();
-        eprintln!(
-            "  Bytes reflinked: {} ({:.2} MB)",
-            stats.bytes_reflinked,
-            stats.bytes_reflinked as f64 / (1024.0 * 1024.0)
-        );
-        eprintln!(
-            "  Bytes copied:    {} ({:.2} MB)",
-            stats.bytes_copied,
-            stats.bytes_copied as f64 / (1024.0 * 1024.0)
-        );
+        if stats.bytes_reflinked > 0 {
+            eprintln!(
+                "  Bytes reflinked:  {} ({:.2} MB)",
+                stats.bytes_reflinked,
+                stats.bytes_reflinked as f64 / (1024.0 * 1024.0)
+            );
+        }
+        if stats.bytes_hardlinked > 0 {
+            eprintln!(
+                "  Bytes hardlinked: {} ({:.2} MB)",
+                stats.bytes_hardlinked,
+                stats.bytes_hardlinked as f64 / (1024.0 * 1024.0)
+            );
+        }
+        if stats.bytes_copied > 0 {
+            eprintln!(
+                "  Bytes copied:     {} ({:.2} MB)",
+                stats.bytes_copied,
+                stats.bytes_copied as f64 / (1024.0 * 1024.0)
+            );
+        }
 
         // Shutdown proxy if used
         storage
@@ -964,7 +1022,8 @@ fn extract_image_cmd(
     storage_root: &Option<PathBuf>,
     image_ref: &str,
     dest: PathBuf,
-    no_reflinks: bool,
+    link_mode: CliLinkMode,
+    fallback_to_copy: bool,
     preserve_ownership: bool,
     no_permissions: bool,
 ) -> Result<()> {
@@ -986,9 +1045,17 @@ fn extract_image_cmd(
     let dest_dir = Dir::open_ambient_dir(&dest, ambient_authority())
         .context("Failed to open destination directory")?;
 
-    // Build extraction options
+    // Build extraction options with appropriate hardlink filter
+    let hardlink_filter = match link_mode {
+        CliLinkMode::Hardlink => Some(std::sync::Arc::new(
+            cstor_rs::extract::DefaultHardlinkFilter,
+        ) as std::sync::Arc<dyn cstor_rs::extract::HardlinkFilter>),
+        _ => None,
+    };
     let options = ExtractionOptions {
-        use_reflinks: !no_reflinks,
+        link_mode: link_mode.into(),
+        fallback_to_copy,
+        hardlink_filter,
         preserve_ownership,
         preserve_permissions: !no_permissions,
         process_whiteouts: true,
@@ -1042,16 +1109,27 @@ fn extract_image_cmd(
             );
         }
         eprintln!();
-        eprintln!(
-            "  Bytes reflinked: {} ({:.2} MB)",
-            stats.bytes_reflinked,
-            stats.bytes_reflinked as f64 / (1024.0 * 1024.0)
-        );
-        eprintln!(
-            "  Bytes copied:    {} ({:.2} MB)",
-            stats.bytes_copied,
-            stats.bytes_copied as f64 / (1024.0 * 1024.0)
-        );
+        if stats.bytes_reflinked > 0 {
+            eprintln!(
+                "  Bytes reflinked:  {} ({:.2} MB)",
+                stats.bytes_reflinked,
+                stats.bytes_reflinked as f64 / (1024.0 * 1024.0)
+            );
+        }
+        if stats.bytes_hardlinked > 0 {
+            eprintln!(
+                "  Bytes hardlinked: {} ({:.2} MB)",
+                stats.bytes_hardlinked,
+                stats.bytes_hardlinked as f64 / (1024.0 * 1024.0)
+            );
+        }
+        if stats.bytes_copied > 0 {
+            eprintln!(
+                "  Bytes copied:     {} ({:.2} MB)",
+                stats.bytes_copied,
+                stats.bytes_copied as f64 / (1024.0 * 1024.0)
+            );
+        }
 
         // Shutdown proxy if used
         storage

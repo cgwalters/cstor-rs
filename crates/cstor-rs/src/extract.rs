@@ -41,8 +41,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use cap_std::fs::{Dir, OpenOptions, Permissions};
+use cap_std::fs::{Dir, Permissions};
 use rustix::fs::{AtFlags, Gid, Uid, ioctl_ficlone};
 
 use crate::error::{Result, StorageError};
@@ -57,6 +58,139 @@ const WHITEOUT_PREFIX: &str = ".wh.";
 /// Opaque whiteout marker filename.
 const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 
+/// Mode for creating file copies during extraction.
+///
+/// This controls how file content is duplicated from the source storage
+/// to the destination directory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LinkMode {
+    /// Try reflink (copy-on-write) first, fall back to copy.
+    ///
+    /// This is the most efficient mode on filesystems that support it
+    /// (btrfs, XFS with reflink=1). The file appears as a copy but shares
+    /// the underlying data blocks until either copy is modified.
+    #[default]
+    Reflink,
+
+    /// Use hardlinks to the source files.
+    ///
+    /// This is efficient on any filesystem but requires that source and
+    /// destination are on the same filesystem. The destination files will
+    /// share inodes with the source storage, so modifications to extracted
+    /// files would affect the storage (though this is read-only storage).
+    ///
+    /// This mode is useful for ext4 and other filesystems that don't support
+    /// reflinks but do support hardlinks.
+    Hardlink,
+
+    /// Always copy file data (no linking).
+    ///
+    /// This is the safest but slowest mode. Use when source and destination
+    /// are on different filesystems, or when you need fully independent copies.
+    Copy,
+}
+
+/// ELF magic bytes.
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+
+/// Minimum file size to consider for hardlinking (16 KiB).
+///
+/// Files smaller than this are copied instead, since the overhead of
+/// hardlink management isn't worth it for tiny files, and small config
+/// files are more likely to be edited.
+pub const HARDLINK_MIN_SIZE_SMALL: u64 = 16 * 1024;
+
+/// File size threshold for unconditional hardlinking (2 MiB).
+///
+/// Files larger than this are always hardlinked regardless of content type,
+/// since the space savings are significant and large files are rarely edited.
+pub const HARDLINK_MIN_SIZE_LARGE: u64 = 2 * 1024 * 1024;
+
+/// Filter to determine which files are safe to hardlink.
+///
+/// When using `LinkMode::Hardlink`, hardlinked files share inodes with the
+/// source storage. This can cause issues:
+/// - `ls -l` shows `nlink > 1`, which can confuse users
+/// - Editors like `vi` may behave unexpectedly
+/// - In-place modifications would affect the storage (though it's read-only)
+///
+/// This filter allows selective hardlinking of files where these issues
+/// are unlikely to matter (e.g., large binaries that won't be edited).
+pub trait HardlinkFilter: Send + Sync {
+    /// Check if a file is safe to hardlink based on its properties.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path of the file within the layer
+    /// * `size` - Size of the file in bytes
+    /// * `header` - First bytes of the file (for magic number detection)
+    ///
+    /// # Returns
+    ///
+    /// `true` if the file should be hardlinked, `false` to copy instead.
+    fn is_hardlink_safe(&self, path: &Path, size: u64, header: &[u8]) -> bool;
+}
+
+/// Default hardlink filter using size and content heuristics.
+///
+/// This filter hardlinks files that are:
+/// 1. ELF executables/libraries larger than 16 KiB, OR
+/// 2. Any file larger than 2 MiB
+///
+/// This filter never hardlinks:
+/// - Empty files (no space savings, often placeholders meant to be written)
+/// - Small config files (likely to be edited, confuses editors with nlink > 1)
+///
+/// The rationale is:
+/// - Large binaries are unlikely to be edited in place
+/// - Space savings matter most for large files
+/// - Small config files in `/etc` should be copied to avoid confusing editors
+#[derive(Debug, Clone, Default)]
+pub struct DefaultHardlinkFilter;
+
+impl HardlinkFilter for DefaultHardlinkFilter {
+    fn is_hardlink_safe(&self, _path: &Path, size: u64, header: &[u8]) -> bool {
+        // Never hardlink empty files - they're often placeholders meant to be written
+        // (e.g., /etc/machine-id, lock files, etc.)
+        if size == 0 {
+            return false;
+        }
+
+        // Very large files: always hardlink
+        if size >= HARDLINK_MIN_SIZE_LARGE {
+            return true;
+        }
+
+        // Medium-sized ELF files: hardlink (binaries/libraries)
+        if size >= HARDLINK_MIN_SIZE_SMALL && header.starts_with(&ELF_MAGIC) {
+            return true;
+        }
+
+        // Small files or non-ELF medium files: copy
+        false
+    }
+}
+
+/// A filter that always allows hardlinking (for testing or when you don't care).
+#[derive(Debug, Clone, Default)]
+pub struct AllowAllHardlinks;
+
+impl HardlinkFilter for AllowAllHardlinks {
+    fn is_hardlink_safe(&self, _path: &Path, _size: u64, _header: &[u8]) -> bool {
+        true
+    }
+}
+
+/// A filter that never allows hardlinking (effectively disables hardlink mode).
+#[derive(Debug, Clone, Default)]
+pub struct DenyAllHardlinks;
+
+impl HardlinkFilter for DenyAllHardlinks {
+    fn is_hardlink_safe(&self, _path: &Path, _size: u64, _header: &[u8]) -> bool {
+        false
+    }
+}
+
 /// Statistics from layer/image extraction.
 #[derive(Debug, Clone, Default)]
 pub struct ExtractionStats {
@@ -66,11 +200,13 @@ pub struct ExtractionStats {
     pub directories_created: usize,
     /// Number of symlinks created.
     pub symlinks_created: usize,
-    /// Number of hardlinks created.
+    /// Number of hardlinks created (from tar entries).
     pub hardlinks_created: usize,
-    /// Bytes reflinked (zero-copy).
+    /// Bytes reflinked (zero-copy via FICLONE).
     pub bytes_reflinked: u64,
-    /// Bytes copied (fallback when reflink fails).
+    /// Bytes hardlinked (zero-copy via hardlink to source).
+    pub bytes_hardlinked: u64,
+    /// Bytes copied (fallback when reflink/hardlink fails).
     pub bytes_copied: u64,
     /// Number of whiteouts processed.
     pub whiteouts_processed: usize,
@@ -83,10 +219,29 @@ pub struct ExtractionStats {
 }
 
 /// Options for extraction.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExtractionOptions {
-    /// Try to use reflinks for file copies. Falls back to regular copy if not supported.
-    pub use_reflinks: bool,
+    /// Mode for creating file copies (reflink, hardlink, or copy).
+    pub link_mode: LinkMode,
+    /// Whether to fall back to copy if the requested link mode fails.
+    ///
+    /// When `false` (default), errors like EXDEV (cross-filesystem) or
+    /// EOPNOTSUPP (not supported) will cause extraction to fail with an error.
+    /// This makes problems visible rather than silently degrading performance.
+    ///
+    /// When `true`, these errors will trigger a fallback to copying the file
+    /// data instead. This is useful when you want best-effort linking but
+    /// need extraction to succeed regardless of filesystem capabilities.
+    pub fallback_to_copy: bool,
+    /// Filter for determining which files to hardlink in `LinkMode::Hardlink`.
+    ///
+    /// When set, only files that pass the filter will be hardlinked; others
+    /// will be copied. This helps avoid issues with small config files where
+    /// hardlinking might confuse editors or users checking link counts.
+    ///
+    /// If `None`, all files are hardlinked (when using hardlink mode).
+    /// Use `Some(Arc::new(DefaultHardlinkFilter))` for sensible defaults.
+    pub hardlink_filter: Option<Arc<dyn HardlinkFilter>>,
     /// Preserve file ownership (requires appropriate capabilities).
     pub preserve_ownership: bool,
     /// Preserve file permissions.
@@ -95,10 +250,67 @@ pub struct ExtractionOptions {
     pub process_whiteouts: bool,
 }
 
+impl std::fmt::Debug for ExtractionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtractionOptions")
+            .field("link_mode", &self.link_mode)
+            .field("fallback_to_copy", &self.fallback_to_copy)
+            .field("hardlink_filter", &self.hardlink_filter.is_some())
+            .field("preserve_ownership", &self.preserve_ownership)
+            .field("preserve_permissions", &self.preserve_permissions)
+            .field("process_whiteouts", &self.process_whiteouts)
+            .finish()
+    }
+}
+
+impl ExtractionOptions {
+    /// Create options with reflink mode (default, no fallback).
+    pub fn with_reflinks() -> Self {
+        Self {
+            link_mode: LinkMode::Reflink,
+            ..Default::default()
+        }
+    }
+
+    /// Create options with hardlink mode using the default filter.
+    ///
+    /// The default filter hardlinks ELF binaries > 16 KiB and any files > 2 MiB,
+    /// while copying smaller files to avoid confusing editors.
+    pub fn with_hardlinks() -> Self {
+        Self {
+            link_mode: LinkMode::Hardlink,
+            hardlink_filter: Some(Arc::new(DefaultHardlinkFilter)),
+            ..Default::default()
+        }
+    }
+
+    /// Create options with hardlink mode without any filter (hardlink everything).
+    ///
+    /// Use with caution: this will hardlink all files including small config files,
+    /// which may confuse editors and show unexpected link counts.
+    pub fn with_hardlinks_unfiltered() -> Self {
+        Self {
+            link_mode: LinkMode::Hardlink,
+            hardlink_filter: None,
+            ..Default::default()
+        }
+    }
+
+    /// Create options with copy mode (no linking).
+    pub fn with_copy() -> Self {
+        Self {
+            link_mode: LinkMode::Copy,
+            ..Default::default()
+        }
+    }
+}
+
 impl Default for ExtractionOptions {
     fn default() -> Self {
         Self {
-            use_reflinks: true,
+            link_mode: LinkMode::Reflink,
+            fallback_to_copy: false,
+            hardlink_filter: None,
             preserve_ownership: true,
             preserve_permissions: true,
             process_whiteouts: true,
@@ -673,7 +885,15 @@ fn extract_regular_file(
     Ok(())
 }
 
-/// Extract file content using reflink if possible, falling back to copy.
+/// Extract file content using the configured link mode.
+///
+/// Depending on the link mode:
+/// - Reflink: Try FICLONE ioctl, optionally fall back to copy
+/// - Hardlink: Create a hardlink to the source file via /proc/self/fd
+/// - Copy: Always copy the file data
+///
+/// If `fallback_to_copy` is false (default), errors from reflink/hardlink
+/// operations will be propagated. If true, we fall back to copying.
 fn extract_file_content(
     path: &Path,
     src_fd: OwnedFd,
@@ -682,43 +902,198 @@ fn extract_file_content(
     options: &ExtractionOptions,
     stats: &mut ExtractionStats,
 ) -> Result<()> {
+    match options.link_mode {
+        LinkMode::Reflink => {
+            extract_file_content_reflink(path, src_fd, size, dest, options.fallback_to_copy, stats)
+        }
+        LinkMode::Hardlink => extract_file_content_hardlink(
+            path,
+            src_fd,
+            size,
+            dest,
+            options.fallback_to_copy,
+            options.hardlink_filter.as_deref(),
+            stats,
+        ),
+        LinkMode::Copy => extract_file_content_copy(path, src_fd, size, dest, stats),
+    }
+}
+
+/// Check if an error indicates reflink is not supported on this filesystem.
+fn is_reflink_unavailable(errno: i32) -> bool {
+    errno == rustix::io::Errno::OPNOTSUPP.raw_os_error()
+        || errno == rustix::io::Errno::XDEV.raw_os_error()
+        || errno == rustix::io::Errno::INVAL.raw_os_error()
+}
+
+/// Check if an error indicates hardlink is not supported/allowed.
+fn is_hardlink_unavailable(errno: i32) -> bool {
+    errno == rustix::io::Errno::XDEV.raw_os_error()
+        || errno == rustix::io::Errno::PERM.raw_os_error()
+        || errno == rustix::io::Errno::OPNOTSUPP.raw_os_error()
+}
+
+/// Extract file content using reflink.
+///
+/// If `fallback_to_copy` is true, falls back to copy on EOPNOTSUPP/EXDEV/EINVAL.
+/// Otherwise, returns an error.
+fn extract_file_content_reflink(
+    path: &Path,
+    src_fd: OwnedFd,
+    size: u64,
+    dest: &Dir,
+    fallback_to_copy: bool,
+    stats: &mut ExtractionStats,
+) -> Result<()> {
     // Create destination file
     let dest_file: std::fs::File = dest.create(path)?.into_std();
 
-    if options.use_reflinks {
-        // Try reflink first
-        match ioctl_ficlone(&dest_file, src_fd.as_fd()) {
-            Ok(()) => {
-                stats.bytes_reflinked += size;
-                stats.files_extracted += 1;
-                return Ok(());
-            }
-            Err(e) => {
-                // Check if reflink is simply not supported
-                let errno = e.raw_os_error();
-                if errno == rustix::io::Errno::OPNOTSUPP.raw_os_error()
-                    || errno == rustix::io::Errno::XDEV.raw_os_error()
-                    || errno == rustix::io::Errno::INVAL.raw_os_error()
-                {
-                    // Fall back to copy
-                } else {
-                    // Other error - still try to fall back
+    // Try reflink
+    match ioctl_ficlone(&dest_file, src_fd.as_fd()) {
+        Ok(()) => {
+            stats.bytes_reflinked += size;
+            stats.files_extracted += 1;
+            Ok(())
+        }
+        Err(e) => {
+            let errno = e.raw_os_error();
+            if is_reflink_unavailable(errno) {
+                if fallback_to_copy {
                     tracing::debug!(
-                        "reflink failed with unexpected error: {}, falling back to copy",
-                        e
+                        "reflink not available ({}), falling back to copy for {:?}",
+                        e,
+                        path
                     );
+                    // Remove the empty file we created and copy instead
+                    drop(dest_file);
+                    extract_file_content_copy(path, src_fd, size, dest, stats)
+                } else {
+                    Err(StorageError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        format!(
+                            "reflink not supported for {:?}: {} (use --fallback-to-copy to allow copying)",
+                            path, e
+                        ),
+                    )))
                 }
+            } else {
+                // Unexpected error - always propagate
+                Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("reflink failed for {:?}: {}", path, e),
+                )))
             }
         }
     }
+}
 
-    // Fall back to copy
+/// Number of bytes to read for file header detection (ELF magic, etc.).
+const HEADER_PEEK_SIZE: usize = 16;
+
+/// Extract file content using hardlink to the source file.
+///
+/// Uses /proc/self/fd/<n> to create a hardlink to the source file.
+/// If a filter is provided, only files that pass the filter will be hardlinked.
+/// If `fallback_to_copy` is true, falls back to copy on EXDEV/EPERM/EOPNOTSUPP.
+/// Otherwise, returns an error.
+fn extract_file_content_hardlink(
+    path: &Path,
+    src_fd: OwnedFd,
+    size: u64,
+    dest: &Dir,
+    fallback_to_copy: bool,
+    filter: Option<&dyn HardlinkFilter>,
+    stats: &mut ExtractionStats,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // If we have a filter, check if this file should be hardlinked
+    if let Some(filter) = filter {
+        // Read the file header to check for magic bytes
+        let mut header = [0u8; HEADER_PEEK_SIZE];
+        let header_len = {
+            let mut file = std::fs::File::from(
+                rustix::io::dup(&src_fd)
+                    .map_err(|e| StorageError::Io(std::io::Error::from_raw_os_error(e.raw_os_error())))?,
+            );
+            file.read(&mut header).unwrap_or(0)
+        };
+
+        if !filter.is_hardlink_safe(path, size, &header[..header_len]) {
+            // Filter says don't hardlink - copy instead
+            tracing::trace!(
+                "hardlink filter rejected {:?} (size={}), copying instead",
+                path,
+                size
+            );
+            return extract_file_content_copy(path, src_fd, size, dest, stats);
+        }
+    }
+
+    // Create hardlink via /proc/self/fd path
+    // This allows creating a hardlink from an open fd without knowing the original path
+    let proc_fd_path = format!("/proc/self/fd/{}", src_fd.as_raw_fd());
+
+    // Use linkat with AT_SYMLINK_FOLLOW to follow the /proc/self/fd symlink
+    // and create a hardlink to the actual file
+    match rustix::fs::linkat(
+        rustix::fs::CWD,
+        &proc_fd_path,
+        dest,
+        path,
+        AtFlags::SYMLINK_FOLLOW,
+    ) {
+        Ok(()) => {
+            stats.bytes_hardlinked += size;
+            stats.files_extracted += 1;
+            Ok(())
+        }
+        Err(e) => {
+            let errno = e.raw_os_error();
+            if is_hardlink_unavailable(errno) {
+                if fallback_to_copy {
+                    tracing::debug!(
+                        "hardlink not available ({}), falling back to copy for {:?}",
+                        e,
+                        path
+                    );
+                    extract_file_content_copy(path, src_fd, size, dest, stats)
+                } else {
+                    Err(StorageError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        format!(
+                            "hardlink not supported for {:?}: {} (use --fallback-to-copy to allow copying)",
+                            path, e
+                        ),
+                    )))
+                }
+            } else {
+                // Unexpected error - always propagate
+                Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("hardlink failed for {:?}: {}", path, e),
+                )))
+            }
+        }
+    }
+}
+
+/// Extract file content by copying data.
+fn extract_file_content_copy(
+    path: &Path,
+    src_fd: OwnedFd,
+    size: u64,
+    dest: &Dir,
+    stats: &mut ExtractionStats,
+) -> Result<()> {
+    let _ = size; // Size is tracked via actual bytes copied
+
     let mut src = std::fs::File::from(src_fd);
     src.seek(SeekFrom::Start(0))?;
 
-    let mut dest_file = dest
-        .open_with(path, OpenOptions::new().write(true))?
-        .into_std();
+    // Remove any existing file and create new
+    let _ = dest.remove_file(path);
+    let mut dest_file = dest.create(path)?.into_std();
 
     let copied = std::io::copy(&mut src, &mut dest_file)?;
     stats.bytes_copied += copied;
@@ -874,10 +1249,108 @@ mod tests {
     #[test]
     fn test_extraction_options_default() {
         let opts = ExtractionOptions::default();
-        assert!(opts.use_reflinks);
+        assert_eq!(opts.link_mode, LinkMode::Reflink);
+        assert!(!opts.fallback_to_copy);
+        assert!(opts.hardlink_filter.is_none());
         assert!(opts.preserve_ownership);
         assert!(opts.preserve_permissions);
         assert!(opts.process_whiteouts);
+    }
+
+    #[test]
+    fn test_extraction_options_constructors() {
+        let reflink = ExtractionOptions::with_reflinks();
+        assert_eq!(reflink.link_mode, LinkMode::Reflink);
+        assert!(!reflink.fallback_to_copy);
+        assert!(reflink.hardlink_filter.is_none());
+
+        let hardlink = ExtractionOptions::with_hardlinks();
+        assert_eq!(hardlink.link_mode, LinkMode::Hardlink);
+        assert!(!hardlink.fallback_to_copy);
+        assert!(hardlink.hardlink_filter.is_some()); // Default filter
+
+        let hardlink_unfiltered = ExtractionOptions::with_hardlinks_unfiltered();
+        assert_eq!(hardlink_unfiltered.link_mode, LinkMode::Hardlink);
+        assert!(hardlink_unfiltered.hardlink_filter.is_none()); // No filter
+
+        let copy = ExtractionOptions::with_copy();
+        assert_eq!(copy.link_mode, LinkMode::Copy);
+        assert!(!copy.fallback_to_copy);
+    }
+
+    #[test]
+    fn test_default_hardlink_filter_empty_files() {
+        let filter = DefaultHardlinkFilter;
+
+        // Empty files should never be hardlinked - no space savings and often
+        // placeholders meant to be written (e.g., /etc/machine-id)
+        assert!(!filter.is_hardlink_safe(Path::new("etc/machine-id"), 0, b""));
+        assert!(!filter.is_hardlink_safe(Path::new("var/lock/file"), 0, b""));
+        assert!(!filter.is_hardlink_safe(Path::new("any/path"), 0, &ELF_MAGIC));
+    }
+
+    #[test]
+    fn test_default_hardlink_filter_small_files() {
+        let filter = DefaultHardlinkFilter;
+        let path = Path::new("etc/passwd");
+
+        // Small file - should not be hardlinked
+        assert!(!filter.is_hardlink_safe(path, 100, b"root:x:0:0"));
+
+        // Small ELF - should not be hardlinked (below threshold)
+        assert!(!filter.is_hardlink_safe(path, 1000, &ELF_MAGIC));
+    }
+
+    #[test]
+    fn test_default_hardlink_filter_elf_binaries() {
+        let filter = DefaultHardlinkFilter;
+        let path = Path::new("usr/bin/ls");
+
+        // ELF above 16KB threshold - should be hardlinked
+        assert!(filter.is_hardlink_safe(path, 20 * 1024, &ELF_MAGIC));
+
+        // Non-ELF above 16KB - should NOT be hardlinked
+        assert!(!filter.is_hardlink_safe(path, 20 * 1024, b"#!/bin/bash\n"));
+    }
+
+    #[test]
+    fn test_default_hardlink_filter_large_files() {
+        let filter = DefaultHardlinkFilter;
+        let path = Path::new("var/cache/large.dat");
+
+        // Very large file - always hardlink regardless of content
+        assert!(filter.is_hardlink_safe(path, 3 * 1024 * 1024, b"random data"));
+
+        // Exactly at 2MB threshold - should be hardlinked
+        assert!(filter.is_hardlink_safe(path, 2 * 1024 * 1024, b"random data"));
+
+        // Just below 2MB threshold, non-ELF - should NOT be hardlinked
+        assert!(!filter.is_hardlink_safe(path, 2 * 1024 * 1024 - 1, b"random data"));
+    }
+
+    #[test]
+    fn test_allow_all_hardlinks() {
+        let filter = AllowAllHardlinks;
+        let path = Path::new("any/path");
+
+        // Always allows
+        assert!(filter.is_hardlink_safe(path, 0, b""));
+        assert!(filter.is_hardlink_safe(path, 100, b"small"));
+    }
+
+    #[test]
+    fn test_deny_all_hardlinks() {
+        let filter = DenyAllHardlinks;
+        let path = Path::new("any/path");
+
+        // Always denies
+        assert!(!filter.is_hardlink_safe(path, 0, b""));
+        assert!(!filter.is_hardlink_safe(path, 10 * 1024 * 1024, &ELF_MAGIC));
+    }
+
+    #[test]
+    fn test_link_mode_default() {
+        assert_eq!(LinkMode::default(), LinkMode::Reflink);
     }
 
     #[test]
@@ -888,6 +1361,7 @@ mod tests {
         assert_eq!(stats.symlinks_created, 0);
         assert_eq!(stats.hardlinks_created, 0);
         assert_eq!(stats.bytes_reflinked, 0);
+        assert_eq!(stats.bytes_hardlinked, 0);
         assert_eq!(stats.bytes_copied, 0);
         assert_eq!(stats.whiteouts_processed, 0);
         assert_eq!(stats.entries_skipped, 0);

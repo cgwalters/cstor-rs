@@ -12,9 +12,22 @@ use cap_std::fs::Dir;
 
 use crate::fixture::TestStorage;
 use crate::integration_test;
-use cstor_rs::extract::{ExtractionOptions, extract_layer};
+use cstor_rs::extract::{extract_layer, ExtractionOptions};
 use cstor_rs::layer::Layer;
 use cstor_rs::{TocEntry, TocEntryType};
+
+/// Create default extraction options with fallback enabled for tests.
+///
+/// Tests run on various filesystems that may not support reflinks,
+/// so we enable fallback to copy for general extraction tests.
+/// Tests that specifically test reflink/hardlink behavior should
+/// construct options manually.
+fn test_extraction_options() -> ExtractionOptions {
+    ExtractionOptions {
+        fallback_to_copy: true,
+        ..ExtractionOptions::default()
+    }
+}
 
 /// Create a temporary directory on a real filesystem (not tmpfs).
 ///
@@ -67,7 +80,7 @@ integration_test!(test_extract_empty_layer, || {
 
     // Extract
     let layer = Layer::open(storage.storage(), &layer_id)?;
-    let options = ExtractionOptions::default();
+    let options = test_extraction_options();
     let stats = extract_layer(storage.storage(), &layer, &dest, &options)?;
 
     // Empty layer should have no extracted content
@@ -95,7 +108,7 @@ integration_test!(test_extract_layer_with_directories, || {
 
     // Extract
     let layer = Layer::open(storage.storage(), &layer_id)?;
-    let options = ExtractionOptions::default();
+    let options = test_extraction_options();
     let stats = extract_layer(storage.storage(), &layer, &dest, &options)?;
 
     // Verify directories were created
@@ -163,7 +176,7 @@ integration_test!(test_extract_layer_with_files, || {
 
     // Extract
     let layer = Layer::open(storage.storage(), &layer_id)?;
-    let options = ExtractionOptions::default();
+    let options = test_extraction_options();
     let stats = extract_layer(storage.storage(), &layer, &dest, &options)?;
 
     // Verify files were extracted
@@ -218,7 +231,7 @@ integration_test!(test_extract_layer_with_symlinks, || {
 
     // Extract
     let layer = Layer::open(storage.storage(), &layer_id)?;
-    let options = ExtractionOptions::default();
+    let options = test_extraction_options();
     let stats = extract_layer(storage.storage(), &layer, &dest, &options)?;
 
     // Verify symlinks were created
@@ -283,11 +296,11 @@ integration_test!(test_extract_with_reflinks_enabled, || {
     let dest_dir = create_real_tmpdir()?;
     let dest = Dir::open_ambient_dir(dest_dir.path(), ambient_authority())?;
 
-    // Extract with reflinks enabled (default)
+    // Extract with reflinks enabled (with fallback for non-CoW filesystems)
     let layer = Layer::open(storage.storage(), &layer_id)?;
     let options = ExtractionOptions {
-        use_reflinks: true,
-        ..Default::default()
+        fallback_to_copy: true, // Allow fallback on non-CoW filesystems
+        ..ExtractionOptions::with_reflinks()
     };
     let stats = extract_layer(storage.storage(), &layer, &dest, &options)?;
 
@@ -339,12 +352,9 @@ integration_test!(test_extract_with_reflinks_disabled, || {
     let dest_dir = create_real_tmpdir()?;
     let dest = Dir::open_ambient_dir(dest_dir.path(), ambient_authority())?;
 
-    // Extract with reflinks disabled
+    // Extract with reflinks disabled (copy mode)
     let layer = Layer::open(storage.storage(), &layer_id)?;
-    let options = ExtractionOptions {
-        use_reflinks: false,
-        ..Default::default()
-    };
+    let options = ExtractionOptions::with_copy();
     let stats = extract_layer(storage.storage(), &layer, &dest, &options)?;
 
     // Verify file was extracted via copy
@@ -422,6 +432,7 @@ integration_test!(test_extract_preserves_permissions, || {
     let options = ExtractionOptions {
         preserve_permissions: true,
         preserve_ownership: false, // Can't test ownership without root
+        fallback_to_copy: true,    // Allow fallback on non-CoW filesystems
         ..Default::default()
     };
     let stats = extract_layer(storage.storage(), &layer, &dest, &options)?;
@@ -481,6 +492,7 @@ integration_test!(test_extract_without_permission_preservation, || {
     let options = ExtractionOptions {
         preserve_permissions: false,
         preserve_ownership: false,
+        fallback_to_copy: true, // Allow fallback on non-CoW filesystems
         ..Default::default()
     };
     let stats = extract_layer(storage.storage(), &layer, &dest, &options)?;
@@ -569,7 +581,7 @@ integration_test!(test_extract_complex_layer, || {
 
     // Extract
     let layer = Layer::open(storage.storage(), &layer_id)?;
-    let options = ExtractionOptions::default();
+    let options = test_extraction_options();
     let stats = extract_layer(storage.storage(), &layer, &dest, &options)?;
 
     // Verify counts
@@ -673,8 +685,17 @@ integration_test!(test_cli_layer_extract, || {
     let dest_path = parent_dir.path().join("extract-dest");
     let dest_path_str = dest_path.to_string_lossy();
 
-    // Run CLI extract command
-    let output = run_cstor(&storage, &["layer", "extract", &layer_id, &dest_path_str])?;
+    // Run CLI extract command with fallback enabled for cross-fs tests
+    let output = run_cstor(
+        &storage,
+        &[
+            "layer",
+            "extract",
+            &layer_id,
+            &dest_path_str,
+            "--fallback-to-copy",
+        ],
+    )?;
 
     assert!(
         output.status.success(),
@@ -726,7 +747,7 @@ integration_test!(test_cli_layer_extract_no_reflinks, || {
     let dest_path = parent_dir.path().join("extract-dest");
     let dest_path_str = dest_path.to_string_lossy();
 
-    // Run CLI extract command with --no-reflinks
+    // Run CLI extract command with --link-mode=copy
     let output = run_cstor(
         &storage,
         &[
@@ -734,7 +755,7 @@ integration_test!(test_cli_layer_extract_no_reflinks, || {
             "extract",
             &layer_id,
             &dest_path_str,
-            "--no-reflinks",
+            "--link-mode=copy",
         ],
     )?;
 
@@ -812,7 +833,7 @@ integration_test!(test_extract_to_readonly_destination, || {
 
     // Try to extract - should fail
     let layer = Layer::open(storage.storage(), &layer_id)?;
-    let options = ExtractionOptions::default();
+    let options = test_extraction_options();
     let result = extract_layer(storage.storage(), &layer, &dest, &options);
 
     // Clean up permissions before checking result (so temp dir can be deleted)
@@ -862,7 +883,7 @@ integration_test!(test_extract_empty_file, || {
 
     // Extract
     let layer = Layer::open(storage.storage(), &layer_id)?;
-    let options = ExtractionOptions::default();
+    let options = test_extraction_options();
     let _stats = extract_layer(storage.storage(), &layer, &dest, &options)?;
 
     // Verify empty file was created
@@ -910,7 +931,7 @@ integration_test!(test_extract_large_file, || {
 
     // Extract
     let layer = Layer::open(storage.storage(), &layer_id)?;
-    let options = ExtractionOptions::default();
+    let options = test_extraction_options();
     let stats = extract_layer(storage.storage(), &layer, &dest, &options)?;
 
     assert!(stats.files_extracted >= 1);
@@ -964,7 +985,7 @@ integration_test!(test_extract_deeply_nested_paths, || {
 
     // Extract
     let layer = Layer::open(storage.storage(), &layer_id)?;
-    let options = ExtractionOptions::default();
+    let options = test_extraction_options();
     let _stats = extract_layer(storage.storage(), &layer, &dest, &options)?;
 
     // Verify deeply nested file exists
