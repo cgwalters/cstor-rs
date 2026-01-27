@@ -60,6 +60,13 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+/// Maximum size for an inline chunk (256 MB).
+///
+/// This limit prevents denial-of-service attacks where a malicious stream
+/// could specify an extremely large inline chunk size, causing unbounded
+/// memory allocation.
+const MAX_INLINE_CHUNK_SIZE: usize = 256 * 1024 * 1024;
+
 use crate::readatreader::ReadAtReader;
 
 use cap_std::fs::{Dir, Permissions};
@@ -240,6 +247,15 @@ impl<R: Read> SplitfdstreamReader<R> {
         if prefix < 0 {
             // Inline chunk: read abs(prefix) bytes
             let len = (-prefix) as usize;
+            if len > MAX_INLINE_CHUNK_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "inline chunk size {} exceeds maximum allowed size {}",
+                        len, MAX_INLINE_CHUNK_SIZE
+                    ),
+                ));
+            }
             self.buffer.clear();
             self.buffer.resize(len, 0);
             self.reader.read_exact(&mut self.buffer)?;
@@ -1049,6 +1065,22 @@ mod tests {
         let mut reader = SplitfdstreamReader::new(buffer.as_slice());
         let result = reader.next_chunk();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_inline_chunk_size_limit() {
+        // Attempt to read a chunk that exceeds MAX_INLINE_CHUNK_SIZE
+        let mut buffer = Vec::new();
+        // Request 512 MB (exceeds 256 MB limit)
+        let prefix: i64 = -(512 * 1024 * 1024);
+        buffer.extend_from_slice(&prefix.to_le_bytes());
+
+        let mut reader = SplitfdstreamReader::new(buffer.as_slice());
+        let result = reader.next_chunk();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds maximum"));
     }
 
     mod reconstruct {
