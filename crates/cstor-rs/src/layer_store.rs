@@ -233,6 +233,29 @@ const WHITEOUT_PREFIX: &str = ".wh.";
 /// Opaque whiteout marker filename.
 const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 
+/// Validate that a path is safe.
+fn validate_path(path: &std::path::Path) -> Result<()> {
+    let path_bytes = path.as_os_str().as_encoded_bytes();
+
+    // Check path length against system limit
+    if path_bytes.len() > libc::PATH_MAX as usize {
+        return Err(StorageError::InvalidStorage(format!(
+            "path exceeds PATH_MAX ({} bytes): {}",
+            libc::PATH_MAX,
+            path.display()
+        )));
+    }
+
+    // Check for null bytes (would cause truncation in C APIs)
+    if path_bytes.contains(&0) {
+        return Err(StorageError::InvalidStorage(
+            "path contains null byte".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// PAX extended header prefix for xattrs (SCHILY.xattr.).
 const PAX_SCHILY_XATTR: &str = "SCHILY.xattr.";
 
@@ -963,6 +986,9 @@ fn extract_tar_to_dir<R: Read>(tar_reader: R, dest: &Dir) -> Result<(u64, Vec<To
         if normalized_path.as_os_str().is_empty() {
             continue;
         }
+
+        // Validate path for security and resource limits
+        validate_path(&normalized_path)?;
 
         // Check for whiteouts - these create special overlay markers
         if let Some(filename) = normalized_path.file_name().and_then(|f| f.to_str()) {

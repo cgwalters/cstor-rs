@@ -58,6 +58,29 @@ const WHITEOUT_PREFIX: &str = ".wh.";
 /// Opaque whiteout marker filename.
 const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 
+/// Validate that a path is safe.
+fn validate_path(path: &Path) -> Result<()> {
+    let path_bytes = path.as_os_str().as_encoded_bytes();
+
+    // Check path length against system limit
+    if path_bytes.len() > libc::PATH_MAX as usize {
+        return Err(StorageError::InvalidStorage(format!(
+            "path exceeds PATH_MAX ({} bytes): {}",
+            libc::PATH_MAX,
+            path.display()
+        )));
+    }
+
+    // Check for null bytes (would cause truncation in C APIs)
+    if path_bytes.contains(&0) {
+        return Err(StorageError::InvalidStorage(
+            "path contains null byte".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Mode for creating file copies during extraction.
 ///
 /// This controls how file content is duplicated from the source storage
@@ -565,6 +588,9 @@ fn extract_toc_entry(
         return Ok(());
     }
 
+    // Validate path for security and resource limits
+    validate_path(path)?;
+
     // Create parent directories
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -688,6 +714,9 @@ fn process_non_file_entry(
         return Ok(());
     }
     let path = Path::new(path_str);
+
+    // Validate path for security and resource limits
+    validate_path(path)?;
 
     // Check for whiteouts
     if options.process_whiteouts
@@ -1102,14 +1131,11 @@ fn extract_file_content_copy(
     Ok(())
 }
 
-/// Maximum size for GNU long names (64KB should be more than enough for any path).
-const MAX_GNU_LONG_NAME_SIZE: u64 = 64 * 1024;
-
 /// Read a GNU long name/linkname from a file descriptor.
 fn read_gnu_long_string(fd: OwnedFd, size: u64) -> Result<String> {
-    if size > MAX_GNU_LONG_NAME_SIZE {
+    if size > libc::PATH_MAX as u64 {
         return Err(StorageError::TarSplitError(
-            "GNU long name too large".into(),
+            format!("GNU long name exceeds PATH_MAX ({} bytes)", size),
         ));
     }
     let mut file = std::fs::File::from(fd);
