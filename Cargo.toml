@@ -50,6 +50,7 @@ ocidir = "0.6.0"
 oci-client = "0.15"
 futures-util = "0.3"
 camino = "1.2.1"
+libc = "0.2"
 rustix = { version = "1.0", features = ["fs", "process", "thread"] }
 rustix-linux-procfs = "0.1"
 comfy-table = "7.2"

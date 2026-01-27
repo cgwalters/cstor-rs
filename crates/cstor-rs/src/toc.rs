@@ -67,6 +67,8 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use libc::PATH_MAX;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
@@ -854,6 +856,12 @@ impl Toc {
 fn read_gnu_long_string(fd: std::os::unix::io::OwnedFd, size: u64) -> Result<String> {
     use std::fs::File;
     use std::io::Read;
+
+    if size > PATH_MAX as u64 {
+        return Err(StorageError::TarSplitError(
+            format!("GNU long name exceeds PATH_MAX ({} bytes)", size),
+        ));
+    }
 
     let mut file = File::from(fd);
     let mut buffer = vec![0u8; size as usize];
