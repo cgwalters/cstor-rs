@@ -236,59 +236,34 @@ const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 /// PAX extended header prefix for xattrs (SCHILY.xattr.).
 const PAX_SCHILY_XATTR: &str = "SCHILY.xattr.";
 
-/// Extract xattrs from a tar entry's PAX extensions.
+/// Apply xattrs from a tar entry to a file.
 ///
-/// Returns a HashMap of xattr name -> value for xattrs we care about.
-/// Currently we extract:
+/// Reads PAX extensions from the entry and applies supported xattrs.
+/// Currently we support:
 /// - `security.capability` - file capabilities (e.g., for ping, sudo)
-///
-/// Other xattrs in the `security.*` namespace may require CAP_SYS_ADMIN
-/// to set, so we handle errors gracefully.
-fn extract_xattrs_from_entry<R: Read>(
-    entry: &mut tar::Entry<'_, R>,
-) -> std::collections::HashMap<String, Vec<u8>> {
-    let mut xattrs = std::collections::HashMap::new();
-
-    // Try to get PAX extensions
-    let pax_extensions = match entry.pax_extensions() {
-        Ok(Some(exts)) => exts,
-        _ => return xattrs,
-    };
-
-    for ext in pax_extensions {
-        let ext = match ext {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        // Check if this is an xattr (SCHILY.xattr.*)
-        let key = match ext.key() {
-            Ok(k) => k,
-            Err(_) => continue,
-        };
-
-        if let Some(xattr_name) = key.strip_prefix(PAX_SCHILY_XATTR) {
-            // Only extract security.capability for now
-            // Other security.* xattrs often require CAP_SYS_ADMIN
-            if xattr_name == "security.capability" {
-                xattrs.insert(xattr_name.to_string(), ext.value_bytes().to_vec());
-            }
-        }
-    }
-
-    xattrs
-}
-
-/// Apply xattrs to a file.
 ///
 /// Logs and ignores errors since xattr operations may fail due to:
 /// - Filesystem not supporting xattrs
 /// - Missing capabilities (e.g., CAP_SETFCAP for security.capability)
 /// - User namespace restrictions
-fn apply_xattrs(dest: &Dir, path: &std::path::Path, xattrs: &std::collections::HashMap<String, Vec<u8>>) {
-    for (name, value) in xattrs {
-        if let Err(e) = dest.setxattr(path, name.as_str(), value) {
-            tracing::debug!("Failed to set xattr {} on {:?}: {}", name, path, e);
+fn apply_entry_xattrs<R: Read>(entry: &mut tar::Entry<'_, R>, dest: &Dir, path: &std::path::Path) {
+    let pax_extensions = match entry.pax_extensions() {
+        Ok(Some(exts)) => exts,
+        _ => return,
+    };
+
+    for ext in pax_extensions.flatten() {
+        let key = match ext.key() {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+
+        // Check if this is an xattr we care about (SCHILY.xattr.security.capability)
+        // Only apply security.capability for now - other security.* xattrs often require CAP_SYS_ADMIN
+        if let Some("security.capability") = key.strip_prefix(PAX_SCHILY_XATTR) {
+            if let Err(e) = dest.setxattr(path, "security.capability", ext.value_bytes()) {
+                tracing::debug!("Failed to set xattr security.capability on {:?}: {}", path, e);
+            }
         }
     }
 }
@@ -968,9 +943,6 @@ fn extract_tar_to_dir<R: Read>(tar_reader: R, dest: &Dir) -> Result<(u64, Vec<To
     for entry_result in archive.entries().map_err(StorageError::Io)? {
         let mut entry = entry_result.map_err(StorageError::Io)?;
 
-        // Extract xattrs from PAX headers before other operations
-        let xattrs = extract_xattrs_from_entry(&mut entry);
-
         // Extract header info before borrowing entry mutably
         let entry_type = entry.header().entry_type();
         let mode = entry.header().mode().unwrap_or(0o644);
@@ -1142,10 +1114,8 @@ fn extract_tar_to_dir<R: Read>(tar_reader: R, dest: &Dir) -> Result<(u64, Vec<To
                     AtFlags::empty(),
                 );
 
-                // Apply xattrs (e.g., security.capability)
-                if !xattrs.is_empty() {
-                    apply_xattrs(dest, &normalized_path, &xattrs);
-                }
+                // Apply xattrs from PAX extensions (e.g., security.capability)
+                apply_entry_xattrs(&mut entry, dest, &normalized_path);
 
                 toc_entries.push(TocEntry {
                     name: normalized_path,
@@ -1257,9 +1227,6 @@ fn extract_splitfdstream_to_dir<R: Read>(
 
     for entry_result in archive.entries().map_err(StorageError::Io)? {
         let mut entry = entry_result.map_err(StorageError::Io)?;
-
-        // Extract xattrs from PAX headers before other operations
-        let xattrs = extract_xattrs_from_entry(&mut entry);
 
         // Extract header info before borrowing entry mutably
         let entry_type = entry.header().entry_type();
@@ -1456,10 +1423,8 @@ fn extract_splitfdstream_to_dir<R: Read>(
                     );
                 }
 
-                // Apply xattrs (e.g., security.capability)
-                if !xattrs.is_empty() {
-                    apply_xattrs(dest, &normalized_path, &xattrs);
-                }
+                // Apply xattrs from PAX extensions (e.g., security.capability)
+                apply_entry_xattrs(&mut entry, dest, &normalized_path);
 
                 stats.files_imported += 1;
                 toc_entries.push(TocEntry {
