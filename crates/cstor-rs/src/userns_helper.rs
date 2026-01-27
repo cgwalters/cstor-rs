@@ -1407,7 +1407,8 @@ impl Drop for StorageProxy {
 #[derive(Debug)]
 enum StorageMode {
     /// Direct access - we can read files directly.
-    Direct(Storage),
+    /// Boxed to reduce enum variant size disparity (Storage is large).
+    Direct(Box<Storage>),
     /// Proxied access via userns helper.
     Proxied {
         /// The proxy connection.
@@ -1485,7 +1486,7 @@ impl ProxiedStorage {
         // Check if we need a proxy
         if can_bypass_file_permissions() {
             Ok(Self {
-                mode: StorageMode::Direct(storage),
+                mode: StorageMode::Direct(Box::new(storage)),
             })
         } else {
             // Need proxy - spawn it
@@ -1508,7 +1509,7 @@ impl ProxiedStorage {
     pub fn open_direct<P: AsRef<Path>>(path: P) -> CstorResult<Self> {
         let storage = Storage::open(path)?;
         Ok(Self {
-            mode: StorageMode::Direct(storage),
+            mode: StorageMode::Direct(Box::new(storage)),
         })
     }
 
