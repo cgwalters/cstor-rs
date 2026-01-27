@@ -24,6 +24,7 @@ cap-std.workspace = true
 rustix.workspace = true
 rusqlite.workspace = true
 flate2.workspace = true
+oci-spec.workspace = true
 serde_json.workspace = true
 tar.workspace = true
 

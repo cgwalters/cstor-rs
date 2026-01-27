@@ -5,3 +5,4 @@ mod extract;
 mod layer_builder;
 mod layer_store;
 mod tar_split_writer;
+mod validate;

@@ -96,6 +96,9 @@ pub mod layer_store;
 // Layer extraction
 pub mod extract;
 
+// Validation
+pub mod validate;
+
 // Splitfdstream binary format
 pub mod splitfdstream;
 
@@ -150,6 +153,9 @@ pub use extract::{
     ExtractionStats, HardlinkFilter, LinkMode, extract_image, extract_image_with_toc,
     extract_layer, HARDLINK_MIN_SIZE_LARGE, HARDLINK_MIN_SIZE_SMALL,
 };
+
+// Validation exports
+pub use validate::{ValidateOptions, ValidationError, ValidationResult, ValidationStats, ValidationWarning};
 
 // Re-export OCI spec types for convenience
 pub use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest};

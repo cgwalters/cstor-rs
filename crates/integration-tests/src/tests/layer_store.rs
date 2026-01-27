@@ -352,8 +352,8 @@ integration_test!(test_delete_removes_symlink, || {
 });
 
 integration_test!(test_create_layer_from_splitfdstream, || {
-    use cstor_rs::ImportOptions;
     use cstor_rs::splitfdstream::SplitfdstreamWriter;
+    use cstor_rs::ImportOptions;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -458,8 +458,8 @@ integration_test!(test_create_layer_from_splitfdstream, || {
 });
 
 integration_test!(test_create_layer_from_splitfdstream_with_parent, || {
-    use cstor_rs::ImportOptions;
     use cstor_rs::splitfdstream::SplitfdstreamWriter;
+    use cstor_rs::ImportOptions;
 
     let storage = TestStorage::new()?;
     let layer_store = storage.storage().layer_store();
@@ -518,8 +518,8 @@ integration_test!(test_create_layer_from_splitfdstream_with_parent, || {
 });
 
 integration_test!(test_create_layer_from_splitfdstream_symlink, || {
-    use cstor_rs::ImportOptions;
     use cstor_rs::splitfdstream::SplitfdstreamWriter;
+    use cstor_rs::ImportOptions;
 
     let storage = TestStorage::new()?;
     let layer_store = storage.storage().layer_store();
